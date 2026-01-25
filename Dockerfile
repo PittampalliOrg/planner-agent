@@ -1,5 +1,5 @@
 # Planner Agent Dockerfile
-# Multi-stage build for a lean production image
+# Multi-stage build for a lean production image with FastAPI workflow service
 
 # =============================================================================
 # Stage 1: Builder - Install dependencies
@@ -48,10 +48,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Set working directory
 WORKDIR /app
 
-# Copy application code
+# Copy application code - all modules for workflow service
 COPY --chown=planner:planner task_manager.py .
 COPY --chown=planner:planner plan_manager.py .
 COPY --chown=planner:planner planner_agent.py .
+COPY --chown=planner:planner workflow_service.py .
+COPY --chown=planner:planner streaming.py .
 COPY --chown=planner:planner main.py .
 
 # Create directories for plans and workspace
@@ -71,15 +73,15 @@ ENV PYTHONUNBUFFERED=1 \
 ENV PLANNER_CWD=/app/workspace \
     PLANNER_PLANS_DIR=/app/plans
 
-# Health check - verify Python and imports work
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "from planner_agent import PlannerAgent; print('OK')" || exit 1
+# Health check - verify FastAPI health endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 
-# Expose no ports - this is a CLI application
-# For Kubernetes, this runs as a Job or CronJob, not a Service
+# Expose FastAPI port
+EXPOSE 8080
 
-# Default entrypoint
-ENTRYPOINT ["python", "main.py"]
+# Default entrypoint - run FastAPI workflow service
+ENTRYPOINT ["uvicorn", "workflow_service:app", "--host", "0.0.0.0", "--port", "8080"]
 
-# Default command (can be overridden in Kubernetes)
-CMD ["--help"]
+# Default command (no additional args needed)
+CMD []

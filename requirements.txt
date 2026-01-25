@@ -7,5 +7,7 @@ dapr>=1.16.0
 # FastAPI for HTTP endpoints
 fastapi>=0.100.0
 uvicorn>=0.23.0
+# HTTP client for streaming events
+httpx>=0.25.0
 # Git operations
 gitpython>=3.1.0

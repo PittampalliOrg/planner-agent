@@ -1,0 +1,135 @@
+# DevSpace Configuration for Planner Agent
+# Enables Kubernetes-native development with hot-reload for Python
+#
+# Architecture:
+#   - Replaces git-clone init container with file sync
+#   - Syncs local Python files to container in real-time
+#   - Runs uvicorn with --reload for hot module replacement
+#
+# Usage:
+#   devspace dev                    # Start development mode
+#   devspace enter                  # Shell into container
+#   devspace sync                   # Manual sync
+#   devspace purge                  # Clean up devspace resources
+
+version: v2beta1
+name: planner-agent
+
+# Development configuration
+dev:
+  planner:
+    # Target the deployment
+    namespace: planner-agent
+    labelSelector:
+      app.kubernetes.io/name: planner-agent
+    container: planner-agent
+
+    # Use Python dev image with reload capability
+    devImage: python:3.11-slim
+    workingDir: /app/planner-agent
+
+    # Resource requirements for development
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+
+    # Command to run in the container
+    # Install dependencies and run uvicorn with reload
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo "=== Planner Agent DevSpace Container ==="
+
+        cd /app/planner-agent
+
+        echo "Installing dependencies..."
+        pip install --no-cache-dir -r requirements.txt
+
+        # Install httpx for streaming (if not in requirements)
+        pip install --no-cache-dir httpx || true
+
+        echo "Starting uvicorn with hot-reload..."
+        exec uvicorn workflow_service:app --host 0.0.0.0 --port 8080 --reload
+
+    # File synchronization - sync Python source files
+    sync:
+      - path: ./:/app/planner-agent
+        initialSync: mirrorLocal
+        startContainer: true
+        waitInitialSync: true
+        onUpload:
+          restartContainer: false  # uvicorn --reload handles changes
+        excludePaths:
+          # Python artifacts
+          - __pycache__/
+          - "*.pyc"
+          - "*.pyo"
+          - .pytest_cache/
+          - .mypy_cache/
+          - "*.egg-info/"
+          - dist/
+          - build/
+          # Dev tooling
+          - .devenv/
+          - .devspace/
+          - .direnv/
+          - .git
+          - .git/
+          - .github/
+          - .idea/
+          - .vscode/
+          # K8s manifests (not needed at runtime)
+          - k8s/
+          # Env files (secrets should come from k8s)
+          - .env
+          - .env.*
+          # Other
+          - "*.md"
+          - "*.log"
+          - Dockerfile
+          - .dockerignore
+          - .gitignore
+
+    # Patches to configure the pod for development
+    patches:
+      # Remove health checks (dev server startup is slower)
+      - op: remove
+        path: spec.containers.name=planner-agent.livenessProbe
+      - op: remove
+        path: spec.containers.name=planner-agent.readinessProbe
+      # Remove init containers (we sync files instead of cloning)
+      - op: remove
+        path: spec.initContainers
+      # Run as root for development to avoid permission issues
+      - op: replace
+        path: spec.containers.name=planner-agent.securityContext
+        value:
+          runAsUser: 0
+          runAsGroup: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+      # Override pod security context
+      - op: replace
+        path: spec.securityContext
+        value:
+          fsGroup: 0
+          runAsNonRoot: false
+
+    # Port forwarding for development
+    ports:
+      - port: "8080"  # FastAPI server
+
+    # Environment variables for development
+    env:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: WORKSPACE_DIR
+        value: /workspace
+      - name: PLANS_DIR
+        value: /plans

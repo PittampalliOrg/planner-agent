@@ -33,6 +33,15 @@ from claude_agent_sdk import (
 
 from task_manager import TaskManager, TaskStatus
 from plan_manager import PlanManager
+from streaming import (
+    stream_execution_started,
+    stream_execution_completed,
+    stream_execution_failed,
+    stream_task_progress,
+    stream_tool_call,
+    stream_tool_result,
+    stream_file_changed,
+)
 
 
 # =============================================================================
@@ -465,6 +474,257 @@ Example steps_json format: [{{"title": "Step 1", "description": "...", "files_af
                     return  # Plan created, we're done
 
         print(f"[Planner Agent] Planning session completed")
+
+    async def run_execution_only(
+        self,
+        plan_id: str,
+        workflow_id: str,
+    ) -> dict[str, Any]:
+        """
+        Execute an approved plan (implementation only, no planning).
+
+        Used by the Dapr workflow service to execute a plan after user approval.
+        Streams progress events to Dapr pub/sub for real-time UI updates.
+
+        Args:
+            plan_id: The ID of the approved plan to execute
+            workflow_id: The Dapr workflow instance ID for streaming
+
+        Returns:
+            dict with success, tasks_completed, tasks_total, files_changed
+        """
+        print(f"[Planner Agent] Starting execution-only session")
+        print(f"[Planner Agent] Plan ID: {plan_id}, Workflow ID: {workflow_id}")
+
+        # Load the plan if not already loaded
+        if not self.plan_manager.current_plan or self.plan_manager.current_plan.id != plan_id:
+            loaded = self.plan_manager.load_plan(plan_id)
+            if not loaded:
+                error = f"Plan {plan_id} not found"
+                await stream_execution_failed(workflow_id, error, 0)
+                return {
+                    "success": False,
+                    "error": error,
+                    "tasks_completed": 0,
+                    "tasks_total": 0,
+                    "files_changed": [],
+                }
+
+        plan = self.plan_manager.current_plan
+
+        # Mark plan as approved if not already
+        if plan.status != "approved":
+            self.plan_manager.approve_plan()
+            self.plan_manager.save_plan()
+
+        # Convert plan to tasks
+        tasks = self.plan_manager.convert_plan_to_tasks(self.task_manager)
+        self.task_manager.save()
+        self.plan_manager.save_plan()
+
+        total_tasks = len(tasks)
+        print(f"[Planner Agent] Created {total_tasks} tasks from plan")
+
+        # Stream execution started
+        await stream_execution_started(workflow_id, plan_id, total_tasks)
+
+        # Track files changed
+        files_changed: list[str] = []
+        tasks_completed = 0
+
+        # Set up execution options
+        options = ClaudeAgentOptions(
+            system_prompt=self._get_execution_system_prompt(),
+            mcp_servers={"planner": self.mcp_server},
+            allowed_tools=[
+                # Task tools
+                "mcp__planner__task_update",
+                "mcp__planner__task_list",
+                "mcp__planner__task_get",
+                # Code exploration tools
+                "Read",
+                "Glob",
+                "Grep",
+                "Bash",
+                # Code modification tools
+                "Write",
+                "Edit",
+            ],
+            permission_mode="acceptEdits",
+            cwd=str(self.cwd),
+        )
+
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                # Execute each task
+                for task in tasks:
+                    # Skip already completed tasks
+                    if task.status == TaskStatus.COMPLETED:
+                        tasks_completed += 1
+                        continue
+
+                    # Mark task as in progress
+                    self.task_manager.update_task(task.id, status=TaskStatus.IN_PROGRESS)
+                    self.task_manager.save()
+                    await stream_task_progress(workflow_id, task.id, "started", task.subject)
+
+                    # Create prompt for this task
+                    task_prompt = f"""Execute the following task:
+
+Task ID: {task.id}
+Subject: {task.subject}
+Description: {task.description}
+
+INSTRUCTIONS:
+1. Implement exactly what the task describes
+2. Use the Write tool to create new files
+3. Use the Edit tool to modify existing files
+4. Use Bash to run any necessary commands (build, format, etc.)
+5. When the task is complete, use task_update to mark it as completed
+
+Focus only on this task. Do not modify any other parts of the codebase."""
+
+                    await client.query(task_prompt)
+
+                    # Process responses and track changes
+                    current_task_files: list[str] = []
+                    task_failed = False
+                    error_message = None
+
+                    async for message in client.receive_response():
+                        if isinstance(message, AssistantMessage):
+                            for block in message.content:
+                                if isinstance(block, ToolUseBlock):
+                                    tool_name = block.name
+                                    tool_input = block.input if hasattr(block, 'input') else {}
+
+                                    # Stream tool call
+                                    await stream_tool_call(
+                                        workflow_id,
+                                        tool_name,
+                                        tool_input if isinstance(tool_input, dict) else {},
+                                        task.id,
+                                    )
+
+                                    # Track file changes
+                                    if tool_name in ("Write", "Edit"):
+                                        file_path = tool_input.get("file_path", "") if isinstance(tool_input, dict) else ""
+                                        if file_path:
+                                            operation = "create" if tool_name == "Write" else "modify"
+                                            if file_path not in current_task_files:
+                                                current_task_files.append(file_path)
+                                            await stream_file_changed(
+                                                workflow_id,
+                                                file_path,
+                                                operation,
+                                                task.id,
+                                            )
+
+                                    print(f"[Planner Agent] Tool: {tool_name}")
+
+                        elif isinstance(message, ResultMessage):
+                            result_text = str(message.result) if message.result else ""
+                            if message.is_error:
+                                error_message = result_text
+                                task_failed = True
+                            await stream_tool_result(
+                                workflow_id,
+                                "execution",
+                                result_text,
+                                message.is_error,
+                                task.id,
+                            )
+
+                    # Update task status
+                    if task_failed:
+                        # Don't mark as failed, leave in progress for potential retry
+                        await stream_task_progress(
+                            workflow_id, task.id, "failed", task.subject, error_message
+                        )
+                    else:
+                        self.task_manager.update_task(task.id, status=TaskStatus.COMPLETED)
+                        self.task_manager.save()
+                        tasks_completed += 1
+                        files_changed.extend(current_task_files)
+                        await stream_task_progress(workflow_id, task.id, "completed", task.subject)
+
+                    print(f"[Planner Agent] Task {task.id} {'completed' if not task_failed else 'failed'}")
+
+            # Update plan status
+            self.plan_manager.current_plan.status = "completed"
+            self.plan_manager.save_plan()
+
+            # Stream execution completed
+            await stream_execution_completed(workflow_id, tasks_completed, files_changed)
+
+            print(f"[Planner Agent] Execution completed: {tasks_completed}/{total_tasks} tasks")
+
+            return {
+                "success": tasks_completed == total_tasks,
+                "tasks_completed": tasks_completed,
+                "tasks_total": total_tasks,
+                "files_changed": list(set(files_changed)),  # Deduplicate
+            }
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[Planner Agent] Execution failed: {error_msg}")
+            await stream_execution_failed(workflow_id, error_msg, tasks_completed)
+
+            return {
+                "success": False,
+                "error": error_msg,
+                "tasks_completed": tasks_completed,
+                "tasks_total": total_tasks,
+                "files_changed": list(set(files_changed)),
+            }
+
+    def _get_execution_system_prompt(self) -> str:
+        """Get the system prompt for execution mode."""
+        return """You are a software implementation agent that executes pre-planned tasks.
+
+## Your Role
+
+You are given specific tasks from an approved implementation plan. Your job is to:
+1. Read and understand the task requirements
+2. Implement exactly what the task describes
+3. Make minimal, focused changes
+4. Mark the task as completed when done
+
+## Guidelines
+
+- Focus ONLY on the current task - do not make additional changes
+- Use Read, Glob, and Grep to understand existing code before modifying
+- Use Write to create new files, Edit to modify existing files
+- Use Bash for running commands (npm, build tools, formatters, etc.)
+- Test your changes if possible (run build, lint, type-check)
+- Mark the task as completed using task_update when done
+
+## Code Quality
+
+- Follow existing code patterns and style
+- Add appropriate error handling
+- Keep changes minimal and focused
+- Don't refactor unrelated code
+
+## Available Tools
+
+For task management:
+- mcp__planner__task_update: Update task status (mark completed when done)
+- mcp__planner__task_list: List all tasks
+- mcp__planner__task_get: Get task details
+
+For code exploration:
+- Read: Read file contents
+- Glob: Find files by pattern
+- Grep: Search file contents
+- Bash: Run shell commands
+
+For implementation:
+- Write: Create new files
+- Edit: Modify existing files
+- Bash: Run commands (tests, builds, etc.)
+"""
 
     async def run_planning_session(self, feature_request: str) -> None:
         """

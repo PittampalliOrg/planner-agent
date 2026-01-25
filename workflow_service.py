@@ -97,6 +97,22 @@ class PlanCreateResponse(BaseModel):
     error: str | None = None
 
 
+class ExecuteRequest(BaseModel):
+    """Request model for plan execution."""
+    repo_path: str
+    plan_id: str
+    workflow_id: str
+
+
+class ExecuteResponse(BaseModel):
+    """Response model for plan execution."""
+    success: bool
+    tasks_completed: int = 0
+    tasks_total: int = 0
+    files_changed: list[str] = []
+    error: str | None = None
+
+
 # =============================================================================
 # FastAPI Lifespan
 # =============================================================================
@@ -122,6 +138,7 @@ async def lifespan(app: FastAPI):
             _workflow_runtime = WorkflowRuntime()
             _workflow_runtime.register_activity(clone_repository_activity)
             _workflow_runtime.register_activity(create_plan_activity)
+            _workflow_runtime.register_activity(execute_plan_activity)
             _workflow_runtime.start()  # Synchronous - do NOT await
             print("[Workflow Service] Dapr workflow runtime started")
         except Exception as e:
@@ -332,6 +349,59 @@ async def create_plan(request: PlanRequest) -> PlanCreateResponse:
         )
 
 
+@app.post("/api/execute", response_model=ExecuteResponse)
+async def execute_plan(request: ExecuteRequest) -> ExecuteResponse:
+    """
+    Execute an approved implementation plan.
+
+    This endpoint is called by the TypeScript executePlanActivity after
+    the user approves a plan. It runs the implementation using Claude SDK.
+    """
+    print(f"[Execute] Starting execution for plan {request.plan_id}")
+    print(f"[Execute] Repository: {request.repo_path}")
+    print(f"[Execute] Workflow ID: {request.workflow_id}")
+
+    try:
+        # Verify the directory exists
+        cwd_path = Path(request.repo_path)
+        if not cwd_path.exists():
+            return ExecuteResponse(
+                success=False,
+                error=f"Directory not found: {request.repo_path}",
+            )
+
+        # Create planner agent
+        agent = PlannerAgent(
+            cwd=request.repo_path,
+            plans_dir=str(PLANS_DIR),
+        )
+
+        # Run execution
+        result = await agent.run_execution_only(
+            plan_id=request.plan_id,
+            workflow_id=request.workflow_id,
+        )
+
+        print(f"[Execute] Completed: {result.get('tasks_completed', 0)}/{result.get('tasks_total', 0)} tasks")
+
+        return ExecuteResponse(
+            success=result.get("success", False),
+            tasks_completed=result.get("tasks_completed", 0),
+            tasks_total=result.get("tasks_total", 0),
+            files_changed=result.get("files_changed", []),
+            error=result.get("error"),
+        )
+
+    except Exception as e:
+        print(f"[Execute] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return ExecuteResponse(
+            success=False,
+            error=f"Execution failed: {str(e)}",
+        )
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -352,6 +422,7 @@ async def root():
         "endpoints": [
             "/api/clone",
             "/api/plan",
+            "/api/execute",
             "/health",
         ],
     }
@@ -442,6 +513,30 @@ def create_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict
             "considerations": plan.considerations,
             "status": plan.status,
         }
+    }
+
+
+def execute_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict:
+    """
+    Dapr activity: Execute an approved plan.
+
+    This activity can be called directly by Dapr workflows if needed.
+    """
+    repo_path = input_data["repo_path"]
+    plan_id = input_data["plan_id"]
+    workflow_id = input_data["workflow_id"]
+
+    agent = PlannerAgent(cwd=repo_path, plans_dir=str(PLANS_DIR))
+
+    # Run async execution in sync context
+    result = asyncio.run(agent.run_execution_only(plan_id, workflow_id))
+
+    return {
+        "success": result.get("success", False),
+        "tasks_completed": result.get("tasks_completed", 0),
+        "tasks_total": result.get("tasks_total", 0),
+        "files_changed": result.get("files_changed", []),
+        "error": result.get("error"),
     }
 
 
