@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: planner-agent-config
+  namespace: planner-agent
+  labels:
+    app.kubernetes.io/name: planner-agent
+data:
+  # Working directory for the agent (where the git repo is cloned)
+  PLANNER_CWD: "/app/workspace"
+  # Directory to store plans and tasks
+  PLANNER_PLANS_DIR: "/app/plans"
+  # Python settings
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"

@@ -1,0 +1,85 @@
+# Planner Agent Dockerfile
+# Multi-stage build for a lean production image
+
+# =============================================================================
+# Stage 1: Builder - Install dependencies
+# =============================================================================
+FROM python:3.12-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# =============================================================================
+# Stage 2: Runtime - Lean production image
+# =============================================================================
+FROM python:3.12-slim AS runtime
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create non-root user for security (Kubernetes best practice)
+RUN groupadd --gid 1000 planner && \
+    useradd --uid 1000 --gid planner --shell /bin/bash --create-home planner
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# The Claude Agent SDK bundles the Claude Code CLI automatically
+# No need to install it separately
+
+# Set working directory
+WORKDIR /app
+
+# Copy application code
+COPY --chown=planner:planner task_manager.py .
+COPY --chown=planner:planner plan_manager.py .
+COPY --chown=planner:planner planner_agent.py .
+COPY --chown=planner:planner main.py .
+
+# Create directories for plans and workspace
+RUN mkdir -p /app/plans /app/workspace && \
+    chown -R planner:planner /app
+
+# Switch to non-root user
+USER planner
+
+# Environment variables
+# ANTHROPIC_API_KEY must be provided at runtime (via Kubernetes Secret)
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/home/planner
+
+# Default working directory for the agent (can be overridden)
+ENV PLANNER_CWD=/app/workspace \
+    PLANNER_PLANS_DIR=/app/plans
+
+# Health check - verify Python and imports work
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "from planner_agent import PlannerAgent; print('OK')" || exit 1
+
+# Expose no ports - this is a CLI application
+# For Kubernetes, this runs as a Job or CronJob, not a Service
+
+# Default entrypoint
+ENTRYPOINT ["python", "main.py"]
+
+# Default command (can be overridden in Kubernetes)
+CMD ["--help"]

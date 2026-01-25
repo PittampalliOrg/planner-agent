@@ -1,0 +1,112 @@
+# Kubernetes Job for running a one-off planning task
+#
+# Usage:
+#   1. Edit the args to specify your feature request
+#   2. Apply: kubectl apply -f job.yaml
+#   3. Watch logs: kubectl logs -f job/planner-agent-job -n planner-agent
+#   4. Clean up: kubectl delete job planner-agent-job -n planner-agent
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: planner-agent-job
+  namespace: planner-agent
+  labels:
+    app.kubernetes.io/name: planner-agent
+    app.kubernetes.io/component: job
+spec:
+  # Don't retry on failure
+  backoffLimit: 0
+  # Clean up completed jobs after 1 hour
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: planner-agent
+        app.kubernetes.io/component: job
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      # Init container to clone the repository (optional)
+      initContainers:
+        - name: git-clone
+          image: alpine/git:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              if [ -n "$GIT_REPO_URL" ]; then
+                echo "Cloning repository: $GIT_REPO_URL"
+                git clone --depth 1 "$GIT_REPO_URL" /workspace
+              else
+                echo "No GIT_REPO_URL provided, skipping clone"
+                mkdir -p /workspace
+              fi
+          env:
+            # Set this to clone a repository before planning
+            - name: GIT_REPO_URL
+              value: ""  # e.g., "https://github.com/your/repo.git"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+
+      containers:
+        - name: planner-agent
+          image: planner-agent:latest
+          imagePullPolicy: IfNotPresent
+
+          # Feature request to plan
+          args:
+            - "--cwd"
+            - "/app/workspace"
+            - "--plans-dir"
+            - "/app/plans"
+            # Replace with your feature request
+            - "Add user authentication with JWT tokens"
+
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: planner-agent-secrets
+                  key: ANTHROPIC_API_KEY
+
+          envFrom:
+            - configMapRef:
+                name: planner-agent-config
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+
+          volumeMounts:
+            - name: workspace
+              mountPath: /app/workspace
+            - name: plans
+              mountPath: /app/plans
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: planner-workspace-pvc
+        - name: plans
+          persistentVolumeClaim:
+            claimName: planner-plans-pvc

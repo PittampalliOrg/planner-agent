@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+*.egg
+
+# Virtual environments
+.venv
+venv
+ENV
+env
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+build
+dist
+*.whl
+
+# Documentation
+*.md
+!README.md
+
+# Environment files (secrets)
+.env
+.env.*
+!.env.example
+
+# Kubernetes manifests (not needed in image)
+k8s/
+
+# Plans directory (runtime data)
+plans/
+
+# Test files
+tests/
+*_test.py
+test_*.py

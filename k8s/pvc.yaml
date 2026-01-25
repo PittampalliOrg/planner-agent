@@ -1,0 +1,35 @@
+# Persistent Volume Claims for workspace and plans
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: planner-workspace-pvc
+  namespace: planner-agent
+  labels:
+    app.kubernetes.io/name: planner-agent
+    app.kubernetes.io/component: workspace
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # Uncomment and modify for your storage class
+  # storageClassName: standard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: planner-plans-pvc
+  namespace: planner-agent
+  labels:
+    app.kubernetes.io/name: planner-agent
+    app.kubernetes.io/component: plans
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # Uncomment and modify for your storage class
+  # storageClassName: standard

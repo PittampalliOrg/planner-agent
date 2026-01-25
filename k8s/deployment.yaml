@@ -1,0 +1,144 @@
+# Kubernetes Deployment for running planner-agent as a Dapr-enabled workflow service
+#
+# This deployment runs the planner-agent as a FastAPI service with:
+#   - HTTP endpoints for clone and plan operations
+#   - Dapr sidecar for workflow orchestration
+#   - Integration with TypeScript workflow-patterns
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planner-agent
+  namespace: planner-agent
+  labels:
+    app.kubernetes.io/name: planner-agent
+    app.kubernetes.io/component: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: planner-agent
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: planner-agent
+        app.kubernetes.io/component: agent
+      annotations:
+        # Dapr sidecar configuration
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "planner-agent"
+        dapr.io/app-port: "8080"
+        dapr.io/app-protocol: "http"
+        dapr.io/enable-api-logging: "true"
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: planner-agent
+          image: planner-agent:latest
+          imagePullPolicy: IfNotPresent
+
+          # Run the FastAPI workflow service
+          command: ["uvicorn"]
+          args:
+            - "workflow_service:app"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8080"
+
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: planner-agent-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: WORKSPACE_DIR
+              value: /workspace
+            - name: PLANS_DIR
+              value: /plans
+
+          envFrom:
+            - configMapRef:
+                name: planner-agent-config
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: plans
+              mountPath: /plans
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+
+          # Liveness probe - HTTP health check
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness probe - HTTP health check
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: planner-workspace-pvc
+        - name: plans
+          persistentVolumeClaim:
+            claimName: planner-plans-pvc
+
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 30
+---
+# Service to expose the planner-agent
+apiVersion: v1
+kind: Service
+metadata:
+  name: planner-agent
+  namespace: planner-agent
+  labels:
+    app.kubernetes.io/name: planner-agent
+    app.kubernetes.io/component: agent
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: planner-agent
+    app.kubernetes.io/component: agent

@@ -1,0 +1,32 @@
+# Kustomization file for deploying planner-agent
+#
+# Usage:
+#   kubectl apply -k k8s/
+#
+# Or with kustomize:
+#   kustomize build k8s/ | kubectl apply -f -
+#
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: planner-agent
+
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - configmap.yaml
+  - pvc.yaml
+  # Choose one of the following based on your use case:
+  # - job.yaml        # For one-off planning tasks
+  - deployment.yaml   # For long-lived service with kubectl exec
+
+commonLabels:
+  app.kubernetes.io/name: planner-agent
+  app.kubernetes.io/version: "1.0.0"
+  app.kubernetes.io/managed-by: kustomize
+
+# Image configuration
+images:
+  - name: planner-agent
+    newName: gitea.cnoe.localtest.me:8443/giteaadmin/planner-agent
+    newTag: latest
