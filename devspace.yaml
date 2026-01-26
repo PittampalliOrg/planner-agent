@@ -24,9 +24,10 @@ dev:
       app.kubernetes.io/name: planner-agent
     container: planner-agent
 
-    # Use Python dev image with reload capability
-    devImage: python:3.11-slim
-    workingDir: /app/planner-agent
+    # Use production image which has Node.js, Claude CLI, and all dependencies
+    # This allows running as non-root user (required for Claude CLI security)
+    devImage: gitea.cnoe.localtest.me:8443/giteaadmin/planner-agent:latest
+    workingDir: /app
 
     # Resource requirements for development
     resources:
@@ -38,31 +39,27 @@ dev:
         memory: "4Gi"
 
     # Command to run in the container
-    # Install dependencies and run uvicorn with reload
+    # Production image already has all dependencies installed
+    # Note: We don't wait for sync since startContainer=false
     command:
       - /bin/sh
       - -c
       - |
-        set -e
         echo "=== Planner Agent DevSpace Container ==="
-
-        cd /app/planner-agent
-
-        echo "Installing dependencies..."
-        pip install --no-cache-dir -r requirements.txt
-
-        # Install httpx for streaming (if not in requirements)
-        pip install --no-cache-dir httpx || true
-
-        echo "Starting uvicorn with hot-reload..."
+        echo "Running as user: $(id)"
+        which claude && claude --version || echo "Warning: Claude CLI not found"
         exec uvicorn workflow_service:app --host 0.0.0.0 --port 8080 --reload
+
+    # Disable restart helper to avoid permission issues with non-root user
+    restartHelper:
+      inject: false
 
     # File synchronization - sync Python source files
     sync:
-      - path: ./:/app/planner-agent
+      - path: ./:/app
         initialSync: mirrorLocal
-        startContainer: true
-        waitInitialSync: true
+        startContainer: false
+        waitInitialSync: false
         onUpload:
           restartContainer: false  # uvicorn --reload handles changes
         excludePaths:
@@ -106,20 +103,20 @@ dev:
       # Remove init containers (we sync files instead of cloning)
       - op: remove
         path: spec.initContainers
-      # Run as root for development to avoid permission issues
+      # Run as non-root user (planner) - required for Claude CLI security
       - op: replace
         path: spec.containers.name=planner-agent.securityContext
         value:
-          runAsUser: 0
-          runAsGroup: 0
-          runAsNonRoot: false
+          runAsUser: 1000
+          runAsGroup: 1000
+          runAsNonRoot: true
           allowPrivilegeEscalation: false
       # Override pod security context
       - op: replace
         path: spec.securityContext
         value:
-          fsGroup: 0
-          runAsNonRoot: false
+          fsGroup: 1000
+          runAsNonRoot: true
 
     # Port forwarding for development
     ports:

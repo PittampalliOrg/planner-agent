@@ -1,0 +1,21 @@
+[project]
+name = "planner-agent"
+version = "0.1.0"
+description = "Durable Planner Agent with Claude Agent SDK and Dapr"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.22",
+    "pydantic>=2.0.0",
+    "rich>=13.0.0",
+    "dapr-agents>=0.5.0",
+    "dapr-ext-workflow>=1.16.0",
+    "dapr>=1.16.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "httpx>=0.25.0",
+    "gitpython>=3.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

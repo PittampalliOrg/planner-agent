@@ -16,6 +16,7 @@ resources:
   - secret.yaml
   - configmap.yaml
   - pvc.yaml
+  - pubsub.yaml       # Dapr pub/sub for event streaming
   # Choose one of the following based on your use case:
   # - job.yaml        # For one-off planning tasks
   - deployment.yaml   # For long-lived service with kubectl exec

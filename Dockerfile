@@ -26,11 +26,17 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # =============================================================================
 FROM python:3.12-slim AS runtime
 
-# Install runtime dependencies
+# Install runtime dependencies including Node.js for Claude CLI
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
+    gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -42,8 +48,8 @@ RUN groupadd --gid 1000 planner && \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# The Claude Agent SDK bundles the Claude Code CLI automatically
-# No need to install it separately
+# Install Claude Code CLI globally (required by claude-agent-sdk)
+RUN npm install -g @anthropic-ai/claude-code
 
 # Set working directory
 WORKDIR /app
@@ -55,6 +61,8 @@ COPY --chown=planner:planner planner_agent.py .
 COPY --chown=planner:planner workflow_service.py .
 COPY --chown=planner:planner streaming.py .
 COPY --chown=planner:planner main.py .
+COPY --chown=planner:planner durable_agent.py .
+COPY --chown=planner:planner anthropic_llm.py .
 
 # Create directories for plans and workspace
 RUN mkdir -p /app/plans /app/workspace && \

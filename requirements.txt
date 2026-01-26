@@ -1,6 +1,16 @@
 claude-agent-sdk>=0.1.22
+anthropic>=0.40.0
 pydantic>=2.0.0
 rich>=13.0.0
+# Dapr Agents for durable agent orchestration with observability
+dapr-agents[observability]>=0.5.0
+# Phoenix Arize for distributed tracing
+arize-phoenix>=8.0.0
+opentelemetry-api>=1.28.0
+opentelemetry-sdk>=1.28.0
+opentelemetry-exporter-otlp>=1.28.0
+# OpenInference Anthropic instrumentor for Claude SDK tracing
+openinference-instrumentation-anthropic>=0.1.0
 # Dapr workflow support
 dapr-ext-workflow>=1.16.0
 dapr>=1.16.0

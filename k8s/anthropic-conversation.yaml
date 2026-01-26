@@ -1,0 +1,17 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: anthropic
+  namespace: ai-chatbot
+spec:
+  type: conversation.anthropic
+  version: v1
+  metadata:
+  - name: key
+    secretKeyRef:
+      name: planner-agent-secrets
+      key: ANTHROPIC_API_KEY
+  - name: model
+    value: claude-sonnet-4-20250514
+  - name: cacheTTL
+    value: 10m

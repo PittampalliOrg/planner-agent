@@ -66,6 +66,11 @@ spec:
               value: /workspace
             - name: PLANS_DIR
               value: /plans
+            # Phoenix Arize observability - GRPC endpoint for trace export
+            - name: PHOENIX_ENDPOINT
+              value: http://phoenix.phoenix-observability.svc.cluster.local:4317
+            - name: PHOENIX_PROJECT_NAME
+              value: planner-agent
 
           envFrom:
             - configMapRef:
