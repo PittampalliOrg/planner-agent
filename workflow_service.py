@@ -62,15 +62,13 @@ from durable_agent import (
     get_durable_agent_status,
     create_durable_plan,
     execute_durable_plan,
-    create_durable_planner_agent,
+    get_workflow_runtime,
+    get_workflow_client,
+    start_workflow_runtime,
+    stop_workflow_runtime,
+    planning_and_execution_workflow,
     DAPR_AGENTS_AVAILABLE,
 )
-
-# Import dapr-agents runner if available
-if DAPR_AGENTS_AVAILABLE:
-    from dapr_agents.workflow.runners import AgentRunner
-else:
-    AgentRunner = None
 
 
 # =============================================================================
@@ -157,11 +155,43 @@ class ExecuteResponse(BaseModel):
     error: str | None = None
 
 
+class PlanStatusUpdateRequest(BaseModel):
+    """Request model for plan status update."""
+    status: str  # "approved" or "rejected"
+    reviewer: str | None = None
+    comments: str | None = None
+
+
+class PlanStatusUpdateResponse(BaseModel):
+    """Response model for plan status update."""
+    success: bool
+    plan_id: str
+    status: str
+    error: str | None = None
+
+
+class WorkflowApprovalRequest(BaseModel):
+    """Request model for workflow approval event."""
+    plan_id: str
+    approved: bool
+    reviewer: str | None = None
+    reason: str | None = None
+
+
+class WorkflowApprovalResponse(BaseModel):
+    """Response model for workflow approval event."""
+    success: bool
+    instance_id: str
+    plan_id: str
+    error: str | None = None
+
+
 class DurablePlanRequest(BaseModel):
     """Request model for durable plan creation."""
     cwd: str
     prompt: str
     session_id: str | None = None
+    workflow_id: str | None = None  # UI workflow ID for streaming events
     use_durable: bool = True  # Whether to use DurableAgent (falls back if unavailable)
 
 
@@ -220,6 +250,36 @@ class AgentMetadata(BaseModel):
     version: str | None = None
 
 
+class WorkflowTargetRepository(BaseModel):
+    """Target repository configuration for workflow."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    token: str | None = None  # GitHub access token for private repos
+
+
+class WorkflowOptions(BaseModel):
+    """Options for workflow execution."""
+    autoApprove: bool = False
+    workingDirectory: str | None = None
+    targetRepository: WorkflowTargetRepository | None = None
+
+
+class WorkflowStartRequest(BaseModel):
+    """Request model for starting a workflow (Next.js compatible)."""
+    prompt: str
+    sessionId: str | None = None
+    options: WorkflowOptions | None = None
+
+
+class WorkflowStartResponse(BaseModel):
+    """Response model for workflow start (Next.js compatible)."""
+    success: bool = True
+    workflowId: str | None = None
+    status: str | None = None
+    error: str | None = None
+
+
 # =============================================================================
 # Claude Agent SDK Tools Definition
 # =============================================================================
@@ -265,7 +325,17 @@ async def register_agent_in_registry() -> bool:
             "appId": AGENT_APP_ID,
             "teamName": AGENT_TEAM_NAME,
             "capabilities": AGENT_CAPABILITIES,
-            "endpoints": ["/api/clone", "/api/plan", "/api/execute", "/api/durable/plan", "/api/durable/execute", "/api/tools"],
+            "endpoints": [
+                "/api/clone",
+                "/api/plan",
+                "/api/execute",
+                "/api/durable/plan",
+                "/api/durable/execute",
+                "/api/durable/plan-and-execute",
+                "/api/plan/{plan_id}/approve",
+                "/api/workflow/{instance_id}/approve",
+                "/api/tools",
+            ],
             "status": "active",
             "registeredAt": datetime.utcnow().isoformat() + "Z",
             "description": "General-purpose planning and execution agent using Claude Agent SDK",
@@ -364,15 +434,12 @@ async def deregister_agent_from_registry() -> bool:
 
 # Global workflow runtime reference for shutdown
 _workflow_runtime = None
-# Global AgentRunner for DurableAgent (must be created once and reused)
-_agent_runner = None
-_durable_agent = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    global _workflow_runtime, _agent_runner, _durable_agent
+    global _workflow_runtime
 
     # Startup
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -389,7 +456,7 @@ async def lifespan(app: FastAPI):
                 protocol="grpc",  # Use gRPC for OTLP export
             )
 
-            # Instrument Dapr Agents operations
+            # Instrument Dapr Agents operations (if available)
             if DaprAgentsInstrumentor:
                 dapr_instrumentor = DaprAgentsInstrumentor()
                 dapr_instrumentor.instrument(tracer_provider=tracer_provider)
@@ -407,16 +474,22 @@ async def lifespan(app: FastAPI):
     else:
         print("[Workflow Service] Phoenix observability not available")
 
-    # Start Dapr workflow runtime if available
-    # Note: WorkflowRuntime.start() is synchronous (starts a background thread)
+    # Start Dapr workflow runtime with Claude SDK native tools
+    # This registers both HTTP activities AND Claude SDK workflow activities
     if DAPR_AVAILABLE and WorkflowRuntime:
         try:
-            _workflow_runtime = WorkflowRuntime()
-            _workflow_runtime.register_activity(clone_repository_activity)
-            _workflow_runtime.register_activity(create_plan_activity)
-            _workflow_runtime.register_activity(execute_plan_activity)
-            _workflow_runtime.start()  # Synchronous - do NOT await
-            print("[Workflow Service] Dapr workflow runtime started")
+            # Get the workflow runtime from durable_agent (includes Claude SDK activities)
+            _workflow_runtime = get_workflow_runtime()
+
+            if _workflow_runtime:
+                # Also register HTTP-related activities (with http_ prefix to avoid collision)
+                _workflow_runtime.register_activity(http_clone_repository_activity)
+                _workflow_runtime.register_activity(http_create_plan_activity)
+                _workflow_runtime.register_activity(http_execute_plan_activity)
+                _workflow_runtime.start()  # Synchronous - do NOT await
+                print("[Workflow Service] Dapr workflow runtime started (Claude SDK native tools)")
+            else:
+                print("[Workflow Service] Warning: Could not get workflow runtime")
         except Exception as e:
             print(f"[Workflow Service] Warning: Could not start Dapr workflow runtime: {e}")
             _workflow_runtime = None
@@ -424,54 +497,19 @@ async def lifespan(app: FastAPI):
         print("[Workflow Service] Dapr not available - running in HTTP-only mode")
 
     # Register agent in the Dapr agent registry
-    # This enables dynamic service discovery via the AgentRegistry
     await register_agent_in_registry()
 
-    # Initialize DurableAgent and register its workflows with our existing runtime
-    # Key insight: DurableAgent has its own workflow definitions that must be registered
-    # with the SAME runtime we're using for other activities
-    if DAPR_AGENTS_AVAILABLE and _workflow_runtime is not None:
-        try:
-            # Create the DurableAgent
-            _durable_agent = create_durable_planner_agent("global-session")
-            if _durable_agent:
-                # Start the agent with our existing runtime
-                # This ensures the agent uses our runtime for workflow execution
-                # auto_register=True will register workflows with our runtime
-                _durable_agent.start(runtime=_workflow_runtime, auto_register=True)
-                print("[Workflow Service] DurableAgent started with shared runtime")
-
-                # Create runner for execution
-                _agent_runner = AgentRunner()
-            else:
-                print("[Workflow Service] Warning: Could not create DurableAgent")
-        except Exception as e:
-            print(f"[Workflow Service] Warning: Could not initialize DurableAgent: {e}")
-            import traceback
-            traceback.print_exc()
-            _agent_runner = None
-            _durable_agent = None
-    else:
-        print("[Workflow Service] dapr-agents not available or runtime not started - DurableAgent disabled")
+    print(f"[Workflow Service] Durable workflows available: {is_durable_agents_available()}")
+    print(f"[Workflow Service] Status: {get_durable_agent_status()}")
 
     yield
 
     # Shutdown - deregister from agent registry first
     await deregister_agent_from_registry()
 
-    if _workflow_runtime is not None:
-        try:
-            _workflow_runtime.shutdown()
-            print("[Workflow Service] Dapr workflow runtime shutdown complete")
-        except Exception as e:
-            print(f"[Workflow Service] Warning: Error during workflow runtime shutdown: {e}")
-
-    if _agent_runner is not None:
-        try:
-            # AgentRunner doesn't have explicit shutdown, but we clear the reference
-            print("[Workflow Service] DurableAgent runner cleanup complete")
-        except Exception as e:
-            print(f"[Workflow Service] Warning: Error during agent runner cleanup: {e}")
+    # Stop workflow runtime
+    await stop_workflow_runtime()
+    print("[Workflow Service] Workflow runtime shutdown complete")
 
 
 
@@ -733,7 +771,7 @@ async def create_durable_plan_endpoint(request: DurablePlanRequest) -> DurablePl
     """
     print(f"[Durable Plan] Creating durable plan for {request.cwd}")
     print(f"[Durable Plan] Prompt: {request.prompt[:100]}...")
-    print(f"[Durable Plan] DurableAgent available: {is_durable_agents_available()}")
+    print(f"[Durable Plan] Claude SDK native tools available: {is_durable_agents_available()}")
 
     try:
         # Verify the directory exists
@@ -744,13 +782,12 @@ async def create_durable_plan_endpoint(request: DurablePlanRequest) -> DurablePl
                 error=f"Directory not found: {request.cwd}",
             )
 
-        # Use durable workflow with global runner and agent (already registered)
+        # Use durable workflow with Claude SDK native tools
         result = await create_durable_plan(
             cwd=request.cwd,
             feature_request=request.prompt,
             session_id=request.session_id,
-            runner=_agent_runner,
-            agent=_durable_agent,
+            workflow_id=request.workflow_id,  # Pass UI workflow ID for streaming
         )
 
         if result.get("success"):
@@ -794,7 +831,7 @@ async def execute_durable_plan_endpoint(request: DurableExecuteRequest) -> Durab
     """
     print(f"[Durable Execute] Starting durable execution for plan {request.plan_id}")
     print(f"[Durable Execute] CWD: {request.cwd}")
-    print(f"[Durable Execute] DurableAgent available: {is_durable_agents_available()}")
+    print(f"[Durable Execute] Claude SDK native tools available: {is_durable_agents_available()}")
 
     try:
         # Verify the directory exists
@@ -805,14 +842,12 @@ async def execute_durable_plan_endpoint(request: DurableExecuteRequest) -> Durab
                 error=f"Directory not found: {request.cwd}",
             )
 
-        # Use durable workflow with global runner and agent (already registered)
+        # Use durable workflow with Claude SDK native tools
         result = await execute_durable_plan(
             cwd=request.cwd,
             plan_id=request.plan_id,
             workflow_id=request.workflow_id,
             session_id=request.session_id,
-            runner=_agent_runner,
-            agent=_durable_agent,
         )
 
         return DurableExecuteResponse(
@@ -850,6 +885,396 @@ async def list_tools() -> ToolsResponse:
     )
 
 
+# =============================================================================
+# Plan Approval Endpoints
+# =============================================================================
+
+@app.post("/api/plan/{plan_id}/approve", response_model=PlanStatusUpdateResponse)
+async def approve_plan(plan_id: str, request: PlanStatusUpdateRequest) -> PlanStatusUpdateResponse:
+    """
+    Update plan status to approved or rejected.
+
+    This endpoint is called by the TypeScript workflow after the user
+    approves a plan via the UI. It persists the approval status to storage
+    before the execution activity runs.
+
+    Args:
+        plan_id: The plan ID to update
+        request: Contains status ("approved" or "rejected"), optional reviewer and comments
+    """
+    from datetime import datetime
+    from plan_manager import PlanManager
+
+    print(f"[Plan Approval] Updating plan {plan_id} to status: {request.status}")
+
+    try:
+        plan_manager = PlanManager(str(PLANS_DIR))
+        plan = plan_manager.load_plan(plan_id)
+
+        if not plan:
+            return PlanStatusUpdateResponse(
+                success=False,
+                plan_id=plan_id,
+                status="",
+                error=f"Plan {plan_id} not found",
+            )
+
+        # Update the plan status
+        plan.status = request.status
+        if request.status == "approved":
+            plan.approved_at = datetime.now().isoformat()
+
+        # Save the updated plan
+        plan_manager.save_plan()
+
+        print(f"[Plan Approval] Plan {plan_id} status updated to {request.status}")
+
+        return PlanStatusUpdateResponse(
+            success=True,
+            plan_id=plan_id,
+            status=request.status,
+        )
+
+    except FileNotFoundError:
+        return PlanStatusUpdateResponse(
+            success=False,
+            plan_id=plan_id,
+            status="",
+            error=f"Plan file {plan_id} not found",
+        )
+    except Exception as e:
+        print(f"[Plan Approval] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return PlanStatusUpdateResponse(
+            success=False,
+            plan_id=plan_id,
+            status="",
+            error=f"Failed to update plan status: {str(e)}",
+        )
+
+
+@app.post("/api/workflow/{instance_id}/approve", response_model=WorkflowApprovalResponse)
+async def approve_workflow_plan(
+    instance_id: str,
+    request: WorkflowApprovalRequest,
+) -> WorkflowApprovalResponse:
+    """
+    Raise approval event to resume a workflow waiting for plan approval.
+
+    This endpoint uses Dapr's native external event mechanism to resume
+    a workflow that is paused at wait_for_external_event. The workflow
+    will continue with execution if approved, or return a rejection result.
+
+    Args:
+        instance_id: The Dapr workflow instance ID
+        request: Contains plan_id, approved status, optional reviewer and reason
+    """
+    from durable_agent import get_workflow_client
+
+    print(f"[Workflow Approval] Raising approval event for workflow {instance_id}")
+    print(f"[Workflow Approval] Plan: {request.plan_id}, Approved: {request.approved}")
+
+    try:
+        client = get_workflow_client()
+
+        if client is None:
+            return WorkflowApprovalResponse(
+                success=False,
+                instance_id=instance_id,
+                plan_id=request.plan_id,
+                error="Dapr workflow client not available",
+            )
+
+        # The event name matches what the workflow is waiting for
+        event_name = f"plan_approval_{request.plan_id}"
+        event_data = {
+            "approved": request.approved,
+            "reviewer": request.reviewer,
+            "reason": request.reason,
+        }
+
+        # Raise the event to resume the workflow
+        client.raise_workflow_event(
+            instance_id=instance_id,
+            event_name=event_name,
+            data=event_data,
+        )
+
+        print(f"[Workflow Approval] Event raised: {event_name}")
+
+        return WorkflowApprovalResponse(
+            success=True,
+            instance_id=instance_id,
+            plan_id=request.plan_id,
+        )
+
+    except Exception as e:
+        print(f"[Workflow Approval] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return WorkflowApprovalResponse(
+            success=False,
+            instance_id=instance_id,
+            plan_id=request.plan_id,
+            error=f"Failed to raise approval event: {str(e)}",
+        )
+
+
+class WorkflowStatusResponse(BaseModel):
+    """Response model for workflow status query."""
+    success: bool
+    instance_id: str
+    runtime_status: str | None = None
+    custom_status: dict | None = None
+    created_at: str | None = None
+    last_updated_at: str | None = None
+    error: str | None = None
+
+
+@app.get("/api/workflow/{instance_id}/status", response_model=WorkflowStatusResponse)
+async def get_workflow_status(instance_id: str) -> WorkflowStatusResponse:
+    """
+    Get the current status of a Dapr workflow.
+
+    Returns:
+    - runtime_status: PENDING, RUNNING, COMPLETED, FAILED, SUSPENDED, TERMINATED
+    - custom_status: Application-defined status with phase, progress, message
+
+    This provides deterministic workflow state instead of inferring from events.
+    """
+    import json
+
+    try:
+        client = get_workflow_client()
+
+        if client is None:
+            return WorkflowStatusResponse(
+                success=False,
+                instance_id=instance_id,
+                error="Dapr workflow client not available",
+            )
+
+        # Get workflow state from Dapr
+        state = client.get_workflow_state(instance_id=instance_id)
+
+        if state is None:
+            return WorkflowStatusResponse(
+                success=False,
+                instance_id=instance_id,
+                error=f"Workflow {instance_id} not found",
+            )
+
+        # Parse custom status from properties
+        custom_status = None
+        if hasattr(state, 'properties') and state.properties:
+            custom_status_str = state.properties.get('dapr.workflow.custom_status')
+            if custom_status_str:
+                try:
+                    custom_status = json.loads(custom_status_str)
+                except json.JSONDecodeError:
+                    custom_status = {"raw": custom_status_str}
+
+        # Get runtime status name
+        runtime_status = None
+        if hasattr(state, 'runtime_status') and state.runtime_status:
+            runtime_status = state.runtime_status.name if hasattr(state.runtime_status, 'name') else str(state.runtime_status)
+
+        return WorkflowStatusResponse(
+            success=True,
+            instance_id=instance_id,
+            runtime_status=runtime_status,
+            custom_status=custom_status,
+            created_at=state.created_at.isoformat() if hasattr(state, 'created_at') and state.created_at else None,
+            last_updated_at=state.last_updated_at.isoformat() if hasattr(state, 'last_updated_at') and state.last_updated_at else None,
+        )
+
+    except Exception as e:
+        print(f"[Workflow Status] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return WorkflowStatusResponse(
+            success=False,
+            instance_id=instance_id,
+            error=f"Failed to get workflow status: {str(e)}",
+        )
+
+
+@app.post("/api/durable/plan-and-execute", response_model=DurablePlanResponse)
+async def create_plan_and_execute_endpoint(request: DurablePlanRequest) -> DurablePlanResponse:
+    """
+    Start a combined planning and execution workflow.
+
+    This endpoint starts a workflow that:
+    1. Explores the codebase
+    2. Creates an implementation plan
+    3. Waits for approval via external event
+    4. Executes the plan when approved
+
+    Returns the workflow instance ID. Use /api/workflow/{instance_id}/approve
+    to approve or reject the plan once it's created.
+    """
+    from durable_agent import get_workflow_client, planning_and_execution_workflow
+
+    print(f"[Durable Plan+Execute] Starting combined workflow for {request.cwd}")
+    print(f"[Durable Plan+Execute] Prompt: {request.prompt[:100]}...")
+
+    try:
+        # Verify the directory exists
+        cwd_path = Path(request.cwd)
+        if not cwd_path.exists():
+            return DurablePlanResponse(
+                success=False,
+                error=f"Directory not found: {request.cwd}",
+            )
+
+        client = get_workflow_client()
+
+        if client is None:
+            return DurablePlanResponse(
+                success=False,
+                error="Dapr workflow client not available",
+            )
+
+        from datetime import datetime
+        import json
+
+        instance_id = request.session_id or f"plan-exec-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+        workflow_input = json.dumps({
+            "cwd": request.cwd,
+            "feature_request": request.prompt,
+            "plans_dir": str(PLANS_DIR),
+        })
+
+        # Start the combined workflow
+        client.schedule_new_workflow(
+            workflow=planning_and_execution_workflow,
+            input=workflow_input,
+            instance_id=instance_id,
+        )
+
+        print(f"[Durable Plan+Execute] Workflow started: {instance_id}")
+
+        return DurablePlanResponse(
+            success=True,
+            plan_id=instance_id,  # Use instance_id as reference
+            title="Workflow started",
+            summary=f"Combined planning and execution workflow started. Use /api/workflow/{instance_id}/approve to approve the plan.",
+            status="pending",
+            durable_execution=True,
+        )
+
+    except Exception as e:
+        print(f"[Durable Plan+Execute] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return DurablePlanResponse(
+            success=False,
+            error=f"Failed to start workflow: {str(e)}",
+        )
+
+
+@app.post("/api/workflows", response_model=WorkflowStartResponse)
+async def start_workflow_endpoint(request: WorkflowStartRequest) -> WorkflowStartResponse:
+    """
+    Start a workflow (Next.js compatible endpoint).
+
+    This is the SINGLE ORCHESTRATOR endpoint for starting workflows.
+    The workflow handles all steps internally:
+    0. Clone repository (if repository info provided)
+    1. Explore the codebase
+    2. Create an implementation plan
+    3. Wait for approval (external event)
+    4. Execute the approved plan
+
+    The clone happens INSIDE the workflow for durability - if the workflow
+    restarts, it can resume from the clone step.
+    """
+    from durable_agent import get_workflow_client, planning_and_execution_workflow
+    from datetime import datetime
+    import json
+
+    print(f"[Workflows] Starting workflow")
+    print(f"[Workflows] Prompt: {request.prompt[:100]}...")
+    if request.sessionId:
+        print(f"[Workflows] Session ID: {request.sessionId}")
+
+    try:
+        # Get workflow client
+        client = get_workflow_client()
+
+        if client is None:
+            return WorkflowStartResponse(
+                success=False,
+                error="Dapr workflow client not available. Ensure Dapr sidecar is running.",
+            )
+
+        # Generate instance ID
+        instance_id = request.sessionId or f"workflow-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+        # Build workflow input - repository info is passed to workflow for durable cloning
+        workflow_input_data: dict[str, Any] = {
+            "feature_request": request.prompt,
+            "plans_dir": str(PLANS_DIR),
+            "auto_approve": request.options.autoApprove if request.options else False,
+            "workflow_id": instance_id,  # For streaming events
+        }
+
+        # Include repository info for workflow to clone (durable operation)
+        if request.options and request.options.targetRepository:
+            repo = request.options.targetRepository
+            print(f"[Workflows] Target repository: {repo.owner}/{repo.repo}@{repo.branch}")
+            has_token = repo.token is not None
+            print(f"[Workflows] Auth token provided: {has_token}")
+            workflow_input_data["repository"] = {
+                "owner": repo.owner,
+                "repo": repo.repo,
+                "branch": repo.branch,
+                "token": repo.token,  # Pass token for authenticated clone
+            }
+            # Don't set cwd - workflow will set it after clone
+        elif request.options and request.options.workingDirectory:
+            # Use provided working directory if no repo specified
+            cwd = request.options.workingDirectory
+            cwd_path = Path(cwd)
+            if not cwd_path.exists():
+                return WorkflowStartResponse(
+                    success=False,
+                    error=f"Working directory not found: {cwd}",
+                )
+            workflow_input_data["cwd"] = cwd
+        else:
+            # Default to workspace
+            workflow_input_data["cwd"] = str(WORKSPACE_DIR)
+
+        workflow_input = json.dumps(workflow_input_data)
+
+        # Start the workflow
+        client.schedule_new_workflow(
+            workflow=planning_and_execution_workflow,
+            input=workflow_input,
+            instance_id=instance_id,
+        )
+
+        print(f"[Workflows] Workflow started: {instance_id}")
+
+        return WorkflowStartResponse(
+            success=True,
+            workflowId=instance_id,
+            status="pending",
+        )
+
+    except Exception as e:
+        print(f"[Workflows] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return WorkflowStartResponse(
+            success=False,
+            error=f"Failed to start workflow: {str(e)}",
+        )
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -857,7 +1282,8 @@ async def health():
     return {
         "status": "healthy",
         "dapr_available": DAPR_AVAILABLE,
-        "dapr_agents_available": durable_status["dapr_agents_available"],
+        "dapr_workflow_available": durable_status["dapr_workflow_available"],
+        "claude_sdk_available": durable_status["claude_sdk_available"],
         "phoenix_available": PHOENIX_AVAILABLE,
         "phoenix_endpoint": PHOENIX_ENDPOINT if PHOENIX_AVAILABLE else None,
         "workspace": str(WORKSPACE_DIR),
@@ -885,6 +1311,10 @@ async def root():
             "/api/execute",
             "/api/durable/plan",
             "/api/durable/execute",
+            "/api/durable/plan-and-execute",
+            "/api/plan/{plan_id}/approve",
+            "/api/workflow/{instance_id}/approve",
+            "/api/workflow/{instance_id}/status",
             "/api/tools",
             "/health",
         ],
@@ -900,9 +1330,9 @@ async def root():
 # Dapr Workflow Activities (for direct Dapr integration)
 # =============================================================================
 
-def clone_repository_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict:
+def http_clone_repository_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict:
     """
-    Dapr activity: Clone repository.
+    Dapr activity: Clone repository (HTTP-style, for backward compatibility).
 
     This activity can be called directly by Dapr workflows if needed.
     """
@@ -945,11 +1375,12 @@ def clone_repository_activity(ctx: WorkflowActivityContext, input_data: dict) ->
     }
 
 
-def create_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict:
+def http_create_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict:
     """
-    Dapr activity: Create plan using Claude SDK.
+    Dapr activity: Create plan using PlannerAgent (HTTP-style, for backward compatibility).
 
     This activity can be called directly by Dapr workflows if needed.
+    The durable_agent.create_plan_activity uses ClaudeSDKClient with native tools instead.
     """
     cwd = input_data["cwd"]
     prompt = input_data["prompt"]
@@ -984,11 +1415,12 @@ def create_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict
     }
 
 
-def execute_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict:
+def http_execute_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict:
     """
-    Dapr activity: Execute an approved plan.
+    Dapr activity: Execute an approved plan (HTTP-style, for backward compatibility).
 
     This activity can be called directly by Dapr workflows if needed.
+    The durable_agent.execute_plan_activity uses ClaudeSDKClient with native tools instead.
     """
     repo_path = input_data["repo_path"]
     plan_id = input_data["plan_id"]
