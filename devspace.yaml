@@ -21,7 +21,7 @@ dev:
     # Target the deployment
     namespace: planner-agent
     labelSelector:
-      app.kubernetes.io/name: planner-agent
+      app: planner-agent
     container: planner-agent
 
     # Use production image which has Node.js, Claude CLI, and all dependencies
@@ -127,6 +127,6 @@ dev:
       - name: PYTHONUNBUFFERED
         value: "1"
       - name: WORKSPACE_DIR
-        value: /workspace
+        value: /app/workspace
       - name: PLANS_DIR
-        value: /plans
+        value: /app/plans

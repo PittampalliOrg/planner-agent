@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Planner Agent - Main Entry Point
+Native Planner Agent - Main Entry Point
 
-A Claude Agent SDK application that replicates Claude Code's plan mode.
-Run this script to start the planner agent.
+A Claude CLI-based application using native Claude Code tools for planning.
+Uses TodoWrite for task creation instead of custom plan managers.
 
 Usage:
     python main.py                          # Interactive mode
@@ -12,37 +12,36 @@ Usage:
 """
 
 import asyncio
+import shutil
 import sys
-
-from claude_agent_sdk import CLINotFoundError, ProcessError, CLIJSONDecodeError
 
 from planner_agent import main
 
 
 async def run_with_error_handling() -> None:
-    """Run the main function with SDK-specific error handling."""
+    """Run the main function with error handling."""
     try:
+        # Check if claude CLI is available
+        if not shutil.which("claude"):
+            print("\nError: Claude Code CLI not found.")
+            print("Install it with:")
+            print("  curl -fsSL https://claude.ai/install.sh | bash")
+            print("\nOr see: https://code.claude.com/docs/en/setup")
+            sys.exit(1)
+
         await main()
-    except CLINotFoundError:
-        print("\nError: Claude Code CLI not found.")
-        print("Install it with:")
-        print("  curl -fsSL https://claude.ai/install.sh | bash")
-        print("\nOr see: https://code.claude.com/docs/en/setup")
+    except FileNotFoundError as e:
+        print(f"\nFile not found error: {e}")
         sys.exit(1)
-    except ProcessError as e:
-        print(f"\nProcess error: {e}")
-        if e.exit_code:
-            print(f"Exit code: {e.exit_code}")
-        if e.stderr:
-            print(f"Details: {e.stderr}")
-        sys.exit(1)
-    except CLIJSONDecodeError as e:
-        print(f"\nFailed to parse CLI response: {e}")
-        print("This may indicate a CLI version mismatch.")
+    except PermissionError as e:
+        print(f"\nPermission error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nSession interrupted by user.")
         sys.exit(0)
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -48,21 +48,21 @@ RUN groupadd --gid 1000 planner && \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install Claude Code CLI globally (required by claude-agent-sdk)
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code CLI globally (latest version for native task tools)
+# Using @latest to ensure we get the most recent version with TaskCreate/TaskUpdate
+RUN npm install -g @anthropic-ai/claude-code@latest && \
+    claude --version
 
 # Set working directory
 WORKDIR /app
 
 # Copy application code - all modules for workflow service
-COPY --chown=planner:planner task_manager.py .
-COPY --chown=planner:planner plan_manager.py .
 COPY --chown=planner:planner planner_agent.py .
 COPY --chown=planner:planner workflow_service.py .
 COPY --chown=planner:planner streaming.py .
 COPY --chown=planner:planner main.py .
 COPY --chown=planner:planner durable_agent.py .
-COPY --chown=planner:planner anthropic_llm.py .
+COPY --chown=planner:planner task_persistence.py .
 
 # Create directories for plans and workspace
 RUN mkdir -p /app/plans /app/workspace && \
@@ -75,7 +75,8 @@ USER planner
 # ANTHROPIC_API_KEY must be provided at runtime (via Kubernetes Secret)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    HOME=/home/planner
+    HOME=/home/planner \
+    CLAUDE_CODE_ENABLE_TASKS=true
 
 # Default working directory for the agent (can be overridden)
 ENV PLANNER_CWD=/app/workspace \
