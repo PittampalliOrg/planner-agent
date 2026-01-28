@@ -10,6 +10,7 @@ import dapr.ext.workflow as wf
 from activities.planning import run_planning
 from activities.persist_tasks import persist_tasks
 from activities.execution import run_execution
+from activities.publish_event import publish_event
 
 wfr = wf.WorkflowRuntime()
 
@@ -23,10 +24,23 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
       2. Persist:    Saves tasks to Dapr statestore
       3. Approval:   Waits for external event (human-in-the-loop gate)
       4. Execution:  Calls execution agent service to implement tasks
+
+    Each phase transition publishes events to the workflow.stream pub/sub
+    topic so the ai-chatbot UI can show real-time updates via SSE.
     """
     workflow_id = ctx.instance_id
     feature_request = input_data.get("feature_request", "")
     cwd = input_data.get("cwd", "")
+
+    # --- Publish: workflow started ---
+    yield ctx.call_activity(publish_event, input={
+        "workflow_id": workflow_id,
+        "event_type": "initial",
+        "data": {
+            "status": "started",
+            "metadata": {"feature_request": feature_request},
+        },
+    })
 
     # --- Phase 1: Planning ---
     ctx.set_custom_status(json.dumps({
@@ -34,6 +48,16 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
         "progress": 10,
         "message": "Creating implementation plan...",
     }))
+
+    yield ctx.call_activity(publish_event, input={
+        "workflow_id": workflow_id,
+        "event_type": "task_progress",
+        "data": {
+            "status": "planning",
+            "progress": 10,
+            "metadata": {"phase": "planning"},
+        },
+    })
 
     planning_input = {
         "workflow_id": workflow_id,
@@ -43,12 +67,18 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
     planning_result = yield ctx.call_activity(run_planning, input=planning_input)
 
     if not planning_result.get("success"):
+        error_msg = planning_result.get("error", "Unknown error")
         ctx.set_custom_status(json.dumps({
             "phase": "failed",
             "progress": 0,
-            "message": f"Planning failed: {planning_result.get('error', 'Unknown error')}",
+            "message": f"Planning failed: {error_msg}",
         }))
-        return {"success": False, "phase": "planning", "error": planning_result.get("error")}
+        yield ctx.call_activity(publish_event, input={
+            "workflow_id": workflow_id,
+            "event_type": "execution_failed",
+            "data": {"error": f"Planning failed: {error_msg}"},
+        })
+        return {"success": False, "phase": "planning", "error": error_msg}
 
     # --- Phase 2: Persist tasks to statestore ---
     ctx.set_custom_status(json.dumps({
@@ -72,6 +102,16 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
         "task_count": len(tasks),
     }))
 
+    yield ctx.call_activity(publish_event, input={
+        "workflow_id": workflow_id,
+        "event_type": "task_progress",
+        "data": {
+            "status": "awaiting_approval",
+            "progress": 50,
+            "metadata": {"phase": "awaiting_approval", "task_count": len(tasks)},
+        },
+    })
+
     # --- Phase 3: Approval gate ---
     approval_event = ctx.wait_for_external_event(f"plan_approval_{workflow_id}")
     timeout_timer = ctx.create_timer(timedelta(hours=24))
@@ -84,6 +124,11 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
             "progress": 0,
             "message": "Approval timed out after 24 hours",
         }))
+        yield ctx.call_activity(publish_event, input={
+            "workflow_id": workflow_id,
+            "event_type": "execution_failed",
+            "data": {"error": "Approval timed out after 24 hours"},
+        })
         return {"success": False, "phase": "approval", "error": "Timed out waiting for approval"}
 
     approval = approval_event.get_result()
@@ -94,6 +139,11 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
             "progress": 0,
             "message": f"Plan rejected: {reason}",
         }))
+        yield ctx.call_activity(publish_event, input={
+            "workflow_id": workflow_id,
+            "event_type": "execution_failed",
+            "data": {"error": f"Plan rejected: {reason}"},
+        })
         return {"success": False, "phase": "approval", "error": f"Plan rejected: {reason}"}
 
     # --- Phase 4: Execution ---
@@ -103,6 +153,17 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
         "message": "Executing implementation tasks...",
     }))
 
+    yield ctx.call_activity(publish_event, input={
+        "workflow_id": workflow_id,
+        "event_type": "execution_started",
+        "agent_id": "claude-code-agent",
+        "data": {
+            "status": "executing",
+            "progress": 60,
+            "metadata": {"phase": "executing", "task_count": len(tasks)},
+        },
+    })
+
     execution_input = {
         "workflow_id": workflow_id,
         "tasks": tasks,
@@ -111,18 +172,36 @@ def unified_planner_workflow(ctx: wf.DaprWorkflowContext, input_data: dict):
     execution_result = yield ctx.call_activity(run_execution, input=execution_input)
 
     if not execution_result.get("success"):
+        error_msg = execution_result.get("error", "Unknown error")
         ctx.set_custom_status(json.dumps({
             "phase": "failed",
             "progress": 0,
-            "message": f"Execution failed: {execution_result.get('error', 'Unknown error')}",
+            "message": f"Execution failed: {error_msg}",
         }))
-        return {"success": False, "phase": "execution", "error": execution_result.get("error")}
+        yield ctx.call_activity(publish_event, input={
+            "workflow_id": workflow_id,
+            "event_type": "execution_failed",
+            "agent_id": "claude-code-agent",
+            "data": {"error": f"Execution failed: {error_msg}"},
+        })
+        return {"success": False, "phase": "execution", "error": error_msg}
 
     ctx.set_custom_status(json.dumps({
         "phase": "completed",
         "progress": 100,
         "message": "Workflow completed successfully",
     }))
+
+    yield ctx.call_activity(publish_event, input={
+        "workflow_id": workflow_id,
+        "event_type": "execution_completed",
+        "agent_id": "claude-code-agent",
+        "data": {
+            "status": "completed",
+            "progress": 100,
+            "metadata": {"task_count": len(tasks)},
+        },
+    })
 
     return {
         "success": True,

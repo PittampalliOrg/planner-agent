@@ -16,6 +16,7 @@ from workflows.planner_workflow import wfr, unified_planner_workflow
 from activities.planning import run_planning
 from activities.persist_tasks import persist_tasks
 from activities.execution import run_execution
+from activities.publish_event import publish_event
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ async def lifespan(app: FastAPI):
     wfr.register_activity(run_planning)
     wfr.register_activity(persist_tasks)
     wfr.register_activity(run_execution)
+    wfr.register_activity(publish_event)
 
     wfr.start()
     logger.info("Planner orchestrator workflow runtime started")

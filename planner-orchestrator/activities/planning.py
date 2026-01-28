@@ -35,7 +35,7 @@ def run_planning(ctx, input_data: dict[str, Any]) -> dict[str, Any]:
     try:
         response = requests.post(
             url,
-            json={"prompt": prompt, "cwd": cwd},
+            json={"prompt": prompt, "cwd": cwd, "workflow_id": workflow_id},
             headers={"dapr-app-timeout": str(PLAN_TIMEOUT_SECONDS)},
             timeout=PLAN_TIMEOUT_SECONDS + 30,
         )

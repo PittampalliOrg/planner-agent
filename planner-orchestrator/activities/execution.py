@@ -31,7 +31,7 @@ def run_execution(ctx, input_data: dict[str, Any]) -> dict[str, Any]:
     try:
         response = requests.post(
             url,
-            json={"prompt": prompt, "cwd": cwd, "tasks": tasks},
+            json={"prompt": prompt, "cwd": cwd, "tasks": tasks, "workflow_id": workflow_id},
             headers={"dapr-app-timeout": str(EXEC_TIMEOUT_SECONDS)},
             timeout=EXEC_TIMEOUT_SECONDS + 30,
         )
