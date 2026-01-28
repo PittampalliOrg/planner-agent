@@ -24,6 +24,9 @@ env
 *.swp
 *.swo
 
+# Node
+**/node_modules
+
 # Build artifacts
 build
 dist
@@ -41,10 +44,21 @@ dist
 # Kubernetes manifests (not needed in image)
 k8s/
 
-# Plans directory (runtime data)
+# Runtime data
 plans/
+workspace/
+.devspace/
 
 # Test files
 tests/
 *_test.py
 test_*.py
+
+# Local dev files
+planner-orchestrator/.venv
+planner-orchestrator/dapr.yaml
+planner-orchestrator/resources/
+*.txt
+!planner-orchestrator/requirements.txt
+hello.py
+agents-catalyst-samples.txt
