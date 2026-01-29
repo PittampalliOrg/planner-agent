@@ -55,12 +55,16 @@ app = FastAPI(
 # --- Request / Response Models ---
 
 class WorkflowStartRequest(BaseModel):
-    feature_request: str = Field(..., description="Feature to plan and implement")
+    feature_request: str | None = Field(default=None, description="Feature to plan and implement")
+    prompt: str | None = Field(default=None, description="Alias for feature_request (chatbot compat)")
     cwd: str = Field(default="", description="Working directory for the agent")
+    sessionId: str | None = Field(default=None, description="Chatbot session ID (optional)")
+    options: dict | None = Field(default=None, description="Chatbot options (optional)")
 
 
 class WorkflowStartResponse(BaseModel):
     workflow_id: str
+    workflowId: str  # Alias for chatbot compatibility
     status: str = "started"
 
 
@@ -83,10 +87,15 @@ class WorkflowStatusResponse(BaseModel):
 @app.post("/api/workflows", response_model=WorkflowStartResponse)
 def start_workflow(request: WorkflowStartRequest):
     """Start a new planner workflow."""
+    # Accept either feature_request or prompt (chatbot sends prompt)
+    feature_request = request.feature_request or request.prompt
+    if not feature_request:
+        raise HTTPException(status_code=400, detail="feature_request or prompt is required")
+
     workflow_id = f"planner-{uuid.uuid4().hex[:12]}"
 
     workflow_input = {
-        "feature_request": request.feature_request,
+        "feature_request": feature_request,
         "cwd": request.cwd,
     }
 
@@ -98,7 +107,7 @@ def start_workflow(request: WorkflowStartRequest):
             instance_id=workflow_id,
         )
         logger.info(f"Workflow started: {instance_id}")
-        return WorkflowStartResponse(workflow_id=instance_id)
+        return WorkflowStartResponse(workflow_id=instance_id, workflowId=instance_id)
     except Exception as e:
         logger.error(f"Failed to start workflow: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -204,6 +213,26 @@ def get_workflow_tasks(workflow_id: str):
     except Exception as e:
         logger.error(f"Failed to get tasks: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Singular path aliases (chatbot sends /api/workflow/ instead of /api/workflows/) ---
+
+@app.get("/api/workflow/{workflow_id}/status")
+def get_workflow_status_singular(workflow_id: str):
+    """Alias: singular /api/workflow/ for chatbot compatibility."""
+    return get_workflow_status(workflow_id)
+
+
+@app.post("/api/workflow/{workflow_id}/approve")
+def approve_workflow_singular(workflow_id: str, request: WorkflowApprovalRequest):
+    """Alias: singular /api/workflow/ for chatbot compatibility."""
+    return approve_workflow(workflow_id, request)
+
+
+@app.get("/api/workflow/{workflow_id}/tasks")
+def get_workflow_tasks_singular(workflow_id: str):
+    """Alias: singular /api/workflow/ for chatbot compatibility."""
+    return get_workflow_tasks(workflow_id)
 
 
 @app.get("/health")

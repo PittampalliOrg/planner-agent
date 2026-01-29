@@ -139,7 +139,7 @@ app.post("/plan", async (req, res) => {
         systemPrompt: { type: "preset", preset: "claude_code" },
         tools: { type: "preset", preset: "claude_code" },
         settingSources: ["project"],
-        permissionMode: "plan" as any,
+        permissionMode: "bypassPermissions" as any,
         cwd: cwd || process.cwd(),
       },
     })) {
