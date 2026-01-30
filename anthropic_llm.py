@@ -57,18 +57,67 @@ except ImportError:
 T = TypeVar("T", bound=BaseModel)
 
 
+class FunctionCall(BaseModel):
+    """Function call details within a tool call."""
+    name: str = ""
+    arguments: str = ""
+
+    @property
+    def arguments_dict(self) -> Dict[str, Any]:
+        """Parse arguments JSON string into a dict."""
+        if not self.arguments:
+            return {}
+        try:
+            return json.loads(self.arguments)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+
+class ToolCall(BaseModel):
+    """Tool call object compatible with dapr-agents expectations."""
+    id: str = ""
+    type: str = "function"
+    function: FunctionCall = Field(default_factory=FunctionCall)
+
+
 class AssistantMessage(BaseModel):
     """
     Assistant message model for dapr-agents compatibility.
 
     dapr-agents expects get_message() to return a Pydantic model with model_dump(),
-    not a plain dict.
+    not a plain dict. The Agent class also calls has_tool_calls() on the message.
     """
     role: str = "assistant"
     content: str = ""
     tool_calls: Optional[List[Dict[str, Any]]] = None
 
     model_config = {"extra": "allow"}
+
+    def has_tool_calls(self) -> bool:
+        """Check if the message contains tool calls."""
+        return bool(self.tool_calls and len(self.tool_calls) > 0)
+
+    def get_tool_calls(self) -> List[ToolCall]:
+        """Get the list of tool calls as ToolCall objects."""
+        if not self.tool_calls:
+            return []
+
+        result = []
+        for tc in self.tool_calls:
+            if isinstance(tc, ToolCall):
+                result.append(tc)
+            elif isinstance(tc, dict):
+                # Convert dict to ToolCall object
+                func_data = tc.get("function", {})
+                result.append(ToolCall(
+                    id=tc.get("id", ""),
+                    type=tc.get("type", "function"),
+                    function=FunctionCall(
+                        name=func_data.get("name", ""),
+                        arguments=func_data.get("arguments", "{}"),
+                    )
+                ))
+        return result
 
 
 class LLMChatResponse(BaseModel):
@@ -179,8 +228,13 @@ class AnthropicChatClient(BaseModel):
         Returns:
             LLMChatResponse with content and any tool calls
         """
+        # Debug logging
+        print(f"[AnthropicChatClient] generate called with messages type={type(messages)}, messages={str(messages)[:500] if messages else 'None'}")
+        print(f"[AnthropicChatClient] kwargs={list(kwargs.keys())}")
+
         # Normalize messages and extract system messages
         anthropic_messages, system_content = self._normalize_messages(messages)
+        print(f"[AnthropicChatClient] After normalize: {len(anthropic_messages)} messages, system={bool(system_content)}")
 
         # Convert tools to Anthropic format
         anthropic_tools = self._convert_tools(tools) if tools else None
@@ -290,6 +344,11 @@ class AnthropicChatClient(BaseModel):
 
         # Combine system parts
         system_content = "\n\n".join(system_parts) if system_parts else None
+
+        # Anthropic requires at least one user message
+        # If we only have system messages, add a minimal user message
+        if not result and system_content:
+            result.append({"role": "user", "content": "Please proceed with your instructions."})
 
         return result, system_content
 

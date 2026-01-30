@@ -13,15 +13,46 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from workflows.planner_workflow import wfr, unified_planner_workflow
+from workflows.dapr_agent_workflow import dapr_agent_workflow
 from activities.planning import run_planning
 from activities.persist_tasks import persist_tasks
 from activities.execution import run_execution
 from activities.publish_event import publish_event
+from activities.dapr_agent import run_dapr_agent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 STATESTORE_NAME = "statestore"
+WORKFLOW_INDEX_KEY = "workflow_index"
+
+
+def _get_workflow_index() -> list[str]:
+    """Get list of all workflow IDs from index."""
+    try:
+        with DaprClient() as client:
+            state = client.get_state(store_name=STATESTORE_NAME, key=WORKFLOW_INDEX_KEY)
+            if state.data:
+                return json.loads(state.data)
+    except Exception as e:
+        logger.warning(f"Failed to get workflow index: {e}")
+    return []
+
+
+def _add_to_workflow_index(workflow_id: str):
+    """Add a workflow ID to the index."""
+    try:
+        index = _get_workflow_index()
+        if workflow_id not in index:
+            index.append(workflow_id)
+            with DaprClient() as client:
+                client.save_state(
+                    store_name=STATESTORE_NAME,
+                    key=WORKFLOW_INDEX_KEY,
+                    value=json.dumps(index),
+                )
+    except Exception as e:
+        logger.warning(f"Failed to update workflow index: {e}")
 
 
 # --- Lifecycle ---
@@ -37,6 +68,7 @@ async def lifespan(app: FastAPI):
     wfr.register_activity(persist_tasks)
     wfr.register_activity(run_execution)
     wfr.register_activity(publish_event)
+    wfr.register_activity(run_dapr_agent)
 
     wfr.start()
     logger.info("Planner orchestrator workflow runtime started")
@@ -107,10 +139,120 @@ def start_workflow(request: WorkflowStartRequest):
             instance_id=workflow_id,
         )
         logger.info(f"Workflow started: {instance_id}")
+        _add_to_workflow_index(instance_id)
         return WorkflowStartResponse(workflow_id=instance_id, workflowId=instance_id)
     except Exception as e:
         logger.error(f"Failed to start workflow: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class DaprAgentWorkflowRequest(BaseModel):
+    """Request to start a DurableAgent workflow."""
+    prompt: str = Field(..., description="Prompt to send to the DurableAgent")
+    cwd: str = Field(default="", description="Working directory for the agent")
+
+
+@app.post("/api/workflows/dapr-agent", response_model=WorkflowStartResponse)
+def start_dapr_agent_workflow(request: DaprAgentWorkflowRequest):
+    """Start a new DurableAgent workflow.
+
+    This workflow invokes the planner-dapr-agent service which runs a DurableAgent
+    with Anthropic Claude for planning tasks.
+    """
+    if not request.prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    workflow_id = f"dapr-agent-{uuid.uuid4().hex[:12]}"
+
+    workflow_input = {
+        "prompt": request.prompt,
+        "cwd": request.cwd,
+    }
+
+    try:
+        client = DaprWorkflowClient()
+        instance_id = client.schedule_new_workflow(
+            workflow=dapr_agent_workflow,
+            input=workflow_input,
+            instance_id=workflow_id,
+        )
+        logger.info(f"DurableAgent workflow started: {instance_id}")
+        _add_to_workflow_index(instance_id)
+        return WorkflowStartResponse(workflow_id=instance_id, workflowId=instance_id)
+    except Exception as e:
+        logger.error(f"Failed to start DurableAgent workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/workflows")
+def list_workflows():
+    """List all workflows with their current status."""
+    workflow_ids = _get_workflow_index()
+    workflows = []
+
+    client = DaprWorkflowClient()
+    for wf_id in workflow_ids:
+        try:
+            state = client.get_workflow_state(instance_id=wf_id)
+            if state is None:
+                continue
+
+            runtime_status = "UNKNOWN"
+            if hasattr(state, "runtime_status") and state.runtime_status:
+                runtime_status = (
+                    state.runtime_status.name
+                    if hasattr(state.runtime_status, "name")
+                    else str(state.runtime_status)
+                )
+
+            # Extract timestamps from Dapr workflow state
+            # Ensure timestamps are in ISO format with UTC timezone suffix
+            created_at = None
+            updated_at = None
+            if hasattr(state, "created_at") and state.created_at:
+                ts = state.created_at.isoformat() if hasattr(state.created_at, "isoformat") else str(state.created_at)
+                # Add Z suffix if not present to indicate UTC
+                created_at = ts if ts.endswith("Z") or "+" in ts else f"{ts}Z"
+            if hasattr(state, "last_updated_at") and state.last_updated_at:
+                ts = state.last_updated_at.isoformat() if hasattr(state.last_updated_at, "isoformat") else str(state.last_updated_at)
+                updated_at = ts if ts.endswith("Z") or "+" in ts else f"{ts}Z"
+
+            # Parse custom status for phase/message
+            phase = None
+            message = None
+            if hasattr(state, "to_json"):
+                state_dict = state.to_json()
+                if isinstance(state_dict, dict):
+                    # Also try to get timestamps from JSON if not available as attributes
+                    if not created_at:
+                        created_at = state_dict.get("created_at") or state_dict.get("createdAt")
+                    if not updated_at:
+                        updated_at = state_dict.get("last_updated_at") or state_dict.get("lastUpdatedAt")
+
+                    custom_str = state_dict.get("serialized_custom_status")
+                    if custom_str:
+                        try:
+                            parsed = json.loads(custom_str)
+                            while isinstance(parsed, str):
+                                parsed = json.loads(parsed)
+                            if isinstance(parsed, dict):
+                                phase = parsed.get("phase")
+                                message = parsed.get("message")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+            workflows.append({
+                "workflow_id": wf_id,
+                "runtime_status": runtime_status,
+                "phase": phase,
+                "message": message,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to get status for {wf_id}: {e}")
+
+    return {"workflows": workflows, "total": len(workflows)}
 
 
 @app.post("/api/workflows/{workflow_id}/approve")

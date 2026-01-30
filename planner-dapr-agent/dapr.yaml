@@ -1,0 +1,13 @@
+version: 1
+common:
+  resourcesPath: ./resources
+  logLevel: info
+  appLogDestination: console
+  daprdLogDestination: console
+
+apps:
+- appID: planner-dapr-agent
+  appDirPath: ./
+  appPort: 8000
+  daprHTTPPort: 3500
+  command: [ "chainlit", "run", "app.py", "-w", "--port", "8000" ]

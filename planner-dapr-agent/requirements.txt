@@ -1,0 +1,15 @@
+# Dapr Agents for durable agent orchestration
+dapr-agents[observability]>=0.5.0
+
+# Anthropic SDK for Claude LLM
+anthropic>=0.40.0
+
+# FastAPI HTTP framework
+fastapi>=0.100.0
+uvicorn>=0.22.0
+
+# Pydantic for data models
+pydantic>=2.0.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
