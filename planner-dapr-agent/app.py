@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from dapr_agents import DurableAgent, tool
 from dapr_agents.workflow.runners import AgentRunner
-from dapr_agents.agents.configs import AgentMemoryConfig, AgentStateConfig
+from dapr_agents.agents.configs import AgentMemoryConfig, AgentStateConfig, AgentExecutionConfig
 from dapr_agents.memory import ConversationDaprStateMemory
 from dapr_agents.storage.daprstores.stateservice import StateStoreService
 from dapr_agents.llm import OpenAIChatClient
@@ -98,22 +98,25 @@ def create_agent():
     # Use OpenAIChatClient - documented default for dapr-agents
     # OPENAI_API_KEY is provided via Azure Key Vault ExternalSecret
     llm = OpenAIChatClient(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        model=os.getenv("OPENAI_MODEL", "gpt-4-turbo"),
     )
 
     agent = DurableAgent(
         name="PlannerAgent",
-        role="Software Planner",
-        goal="Create implementation plans with tasks",
+        role="Task Creator",
+        goal="Create implementation tasks using the create_task tool",
         instructions=[
-            "You MUST use the create_task tool to create each task - do NOT just describe tasks in text",
-            "Analyze the codebase using list_directory and read_file tools to understand the project",
-            "For each task, call create_task with a clear subject and detailed description",
-            "Use blocked_by parameter to set dependencies between tasks (pass task IDs)",
-            "After creating ALL tasks, call get_tasks_json to include them in the final response",
+            "For each task needed, call create_task with subject and description",
+            "Use blocked_by to set task dependencies (pass task IDs as strings)",
+            "After creating all tasks, call get_tasks_json to return the task list",
         ],
-        tools=[create_task, list_tasks, list_directory, read_file, get_tasks_json],
+        tools=[create_task, list_tasks, get_tasks_json],
         llm=llm,
+        # Execution config
+        execution=AgentExecutionConfig(
+            tool_choice="auto",
+            max_iterations=15,
+        ),
         # State: workflow activity checkpoints (enables replay on failure)
         state=AgentStateConfig(
             store=StateStoreService(store_name="statestore")
