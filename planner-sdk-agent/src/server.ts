@@ -130,8 +130,10 @@ app.post("/plan", async (req, res) => {
     const output: string[] = [];
     let messageCount = 0;
     let toolUseCount = 0;
-    // Buffer text chunks to publish as llm_chunk events in batches
+    // Buffer text chunks to publish as TextUIPart events in batches
     let textBuffer = "";
+    // Track pending tool calls to include required fields in results
+    const pendingToolCalls = new Map<string, { toolName: string; input: unknown }>();
 
     for await (const msg of query({
       prompt,
@@ -146,18 +148,50 @@ app.post("/plan", async (req, res) => {
       messageCount++;
       if (msg.type === "assistant") {
         for (const b of msg.message.content) {
-          if (b.type === "text") {
+          if (b.type === "thinking") {
+            // Extended thinking blocks - publish as ReasoningUIPart
+            const thinkingBlock = b as { type: "thinking"; thinking: string };
+            if (workflow_id && thinkingBlock.thinking) {
+              // Flush any pending text first to maintain order
+              if (textBuffer.length > 0) {
+                publishEvent(workflow_id, "part", {
+                  type: "text",
+                  text: textBuffer,
+                  state: "done",
+                });
+                textBuffer = "";
+              }
+              publishEvent(workflow_id, "part", {
+                type: "reasoning",
+                text: thinkingBlock.thinking,
+                state: "done",
+              });
+              log("debug", "Published reasoning part", {
+                length: thinkingBlock.thinking.length,
+              });
+            }
+          } else if (b.type === "text") {
             output.push(b.text);
             textBuffer += b.text;
-            // Publish accumulated text as llm_chunk event
+            // Publish accumulated text as TextUIPart
             if (workflow_id && textBuffer.length > 0) {
-              publishEvent(workflow_id, "llm_chunk", {
-                content: textBuffer,
+              publishEvent(workflow_id, "part", {
+                type: "text",
                 text: textBuffer,
+                state: "done",
               });
               textBuffer = "";
             }
           } else if (b.type === "tool_use") {
+            // Flush any pending text before tool call to maintain order
+            if (workflow_id && textBuffer.length > 0) {
+              publishEvent(workflow_id, "part", {
+                type: "text",
+                text: textBuffer,
+                state: "done",
+              });
+              textBuffer = "";
+            }
             toolUseCount++;
             log("debug", "Tool use: " + b.name, {
               toolId: b.id,
@@ -165,13 +199,104 @@ app.post("/plan", async (req, res) => {
                 ? Object.keys(b.input as Record<string, unknown>)
                 : [],
             });
-            // Publish tool_call event
+            // Track for correlation with result
+            pendingToolCalls.set(b.id, { toolName: b.name, input: b.input });
+            // Publish as DynamicToolUIPart with input-available state
             if (workflow_id) {
-              publishEvent(workflow_id, "tool_call", {
+              publishEvent(workflow_id, "part", {
+                type: "dynamic-tool",
+                toolCallId: b.id,
                 toolName: b.name,
-                toolInput: b.input,
-                callId: b.id,
+                state: "input-available",
+                input: b.input,
               });
+              // Emit semantic events for plan/task tools
+              if (b.name === "EnterPlanMode") {
+                publishEvent(workflow_id, "plan_created", {
+                  toolCallId: b.id,
+                });
+              }
+            }
+          }
+        }
+      } else if (msg.type === "user" && msg.message?.content) {
+        // Handle tool results - they come back in user messages
+        const content = msg.message.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "tool_result") {
+              const toolResult = block as { type: "tool_result"; tool_use_id: string; content?: unknown; is_error?: boolean };
+              log("debug", "Tool result received", {
+                toolUseId: toolResult.tool_use_id,
+                isError: toolResult.is_error,
+              });
+              // Get the pending tool call info for required fields
+              const pending = pendingToolCalls.get(toolResult.tool_use_id);
+              // Publish as DynamicToolUIPart with output state
+              if (workflow_id) {
+                const resultContent = typeof toolResult.content === "string"
+                  ? toolResult.content
+                  : JSON.stringify(toolResult.content);
+                if (toolResult.is_error) {
+                  publishEvent(workflow_id, "part", {
+                    type: "dynamic-tool",
+                    toolCallId: toolResult.tool_use_id,
+                    toolName: pending?.toolName || "unknown",
+                    state: "output-error",
+                    input: pending?.input,
+                    errorText: resultContent,
+                  });
+                } else {
+                  publishEvent(workflow_id, "part", {
+                    type: "dynamic-tool",
+                    toolCallId: toolResult.tool_use_id,
+                    toolName: pending?.toolName || "unknown",
+                    state: "output-available",
+                    input: pending?.input,
+                    output: resultContent,
+                  });
+                  // Emit semantic events for task/plan tool results
+                  if (pending?.toolName === "TaskCreate") {
+                    // Parse the task data from the result or input
+                    try {
+                      const taskInput = pending.input as Record<string, unknown>;
+                      const taskData = {
+                        id: (JSON.parse(resultContent) as any)?.id || String(Date.now()),
+                        subject: taskInput?.subject as string || "",
+                        description: taskInput?.description as string || "",
+                        activeForm: taskInput?.activeForm as string,
+                        status: "pending" as const,
+                        blocks: taskInput?.blocks as string[] | undefined,
+                        blockedBy: taskInput?.blockedBy as string[] | undefined,
+                      };
+                      publishEvent(workflow_id, "task_created", {
+                        task: taskData,
+                        toolCallId: toolResult.tool_use_id,
+                      });
+                    } catch {
+                      // Fallback: emit with minimal data
+                      publishEvent(workflow_id, "task_created", {
+                        task: pending.input,
+                        toolCallId: toolResult.tool_use_id,
+                      });
+                    }
+                  } else if (pending?.toolName === "TaskUpdate") {
+                    const updateInput = pending.input as Record<string, unknown>;
+                    publishEvent(workflow_id, "task_updated", {
+                      taskId: updateInput?.taskId as string,
+                      taskStatus: updateInput?.status as string,
+                      toolCallId: toolResult.tool_use_id,
+                    });
+                  } else if (pending?.toolName === "ExitPlanMode") {
+                    publishEvent(workflow_id, "plan_complete", {
+                      toolCallId: toolResult.tool_use_id,
+                    });
+                  }
+                }
+                if (pending) {
+                  pendingToolCalls.delete(toolResult.tool_use_id);
+                }
+              }
             }
           }
         }
@@ -184,9 +309,10 @@ app.post("/plan", async (req, res) => {
 
     // Flush any remaining text
     if (workflow_id && textBuffer.length > 0) {
-      publishEvent(workflow_id, "llm_chunk", {
-        content: textBuffer,
+      publishEvent(workflow_id, "part", {
+        type: "text",
         text: textBuffer,
+        state: "done",
       });
     }
 
@@ -261,6 +387,8 @@ app.post("/execute", async (req, res) => {
     let messageCount = 0;
     let toolUseCount = 0;
     let textBuffer = "";
+    // Track pending tool calls to include required fields in results
+    const pendingToolCalls = new Map<string, { toolName: string; input: unknown }>();
 
     for await (const msg of query({
       prompt,
@@ -275,18 +403,50 @@ app.post("/execute", async (req, res) => {
       messageCount++;
       if (msg.type === "assistant") {
         for (const b of msg.message.content) {
-          if (b.type === "text") {
+          if (b.type === "thinking") {
+            // Extended thinking blocks - publish as ReasoningUIPart
+            const thinkingBlock = b as { type: "thinking"; thinking: string };
+            if (workflow_id && thinkingBlock.thinking) {
+              // Flush any pending text first to maintain order
+              if (textBuffer.length > 0) {
+                publishEvent(workflow_id, "part", {
+                  type: "text",
+                  text: textBuffer,
+                  state: "done",
+                }, "claude-code-agent");
+                textBuffer = "";
+              }
+              publishEvent(workflow_id, "part", {
+                type: "reasoning",
+                text: thinkingBlock.thinking,
+                state: "done",
+              }, "claude-code-agent");
+              log("debug", "Published reasoning part", {
+                length: thinkingBlock.thinking.length,
+              });
+            }
+          } else if (b.type === "text") {
             output.push(b.text);
             textBuffer += b.text;
-            // Publish accumulated text as llm_chunk event
+            // Publish accumulated text as TextUIPart
             if (workflow_id && textBuffer.length > 0) {
-              publishEvent(workflow_id, "llm_chunk", {
-                content: textBuffer,
+              publishEvent(workflow_id, "part", {
+                type: "text",
                 text: textBuffer,
+                state: "done",
               }, "claude-code-agent");
               textBuffer = "";
             }
           } else if (b.type === "tool_use") {
+            // Flush any pending text before tool call to maintain order
+            if (workflow_id && textBuffer.length > 0) {
+              publishEvent(workflow_id, "part", {
+                type: "text",
+                text: textBuffer,
+                state: "done",
+              }, "claude-code-agent");
+              textBuffer = "";
+            }
             toolUseCount++;
             log("debug", "Tool use: " + b.name, {
               toolId: b.id,
@@ -294,13 +454,102 @@ app.post("/execute", async (req, res) => {
                 ? Object.keys(b.input as Record<string, unknown>)
                 : [],
             });
-            // Publish tool_call event
+            // Track for correlation with result
+            pendingToolCalls.set(b.id, { toolName: b.name, input: b.input });
+            // Publish as DynamicToolUIPart with input-available state
             if (workflow_id) {
-              publishEvent(workflow_id, "tool_call", {
+              publishEvent(workflow_id, "part", {
+                type: "dynamic-tool",
+                toolCallId: b.id,
                 toolName: b.name,
-                toolInput: b.input,
-                callId: b.id,
+                state: "input-available",
+                input: b.input,
               }, "claude-code-agent");
+              // Emit semantic events for plan/task tools
+              if (b.name === "EnterPlanMode") {
+                publishEvent(workflow_id, "plan_created", {
+                  toolCallId: b.id,
+                }, "claude-code-agent");
+              }
+            }
+          }
+        }
+      } else if (msg.type === "user" && msg.message?.content) {
+        // Handle tool results - they come back in user messages
+        const content = msg.message.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "tool_result") {
+              const toolResult = block as { type: "tool_result"; tool_use_id: string; content?: unknown; is_error?: boolean };
+              log("debug", "Tool result received", {
+                toolUseId: toolResult.tool_use_id,
+                isError: toolResult.is_error,
+              });
+              // Get the pending tool call info for required fields
+              const pending = pendingToolCalls.get(toolResult.tool_use_id);
+              // Publish as DynamicToolUIPart with output state
+              if (workflow_id) {
+                const resultContent = typeof toolResult.content === "string"
+                  ? toolResult.content
+                  : JSON.stringify(toolResult.content);
+                if (toolResult.is_error) {
+                  publishEvent(workflow_id, "part", {
+                    type: "dynamic-tool",
+                    toolCallId: toolResult.tool_use_id,
+                    toolName: pending?.toolName || "unknown",
+                    state: "output-error",
+                    input: pending?.input,
+                    errorText: resultContent,
+                  }, "claude-code-agent");
+                } else {
+                  publishEvent(workflow_id, "part", {
+                    type: "dynamic-tool",
+                    toolCallId: toolResult.tool_use_id,
+                    toolName: pending?.toolName || "unknown",
+                    state: "output-available",
+                    input: pending?.input,
+                    output: resultContent,
+                  }, "claude-code-agent");
+                  // Emit semantic events for task/plan tool results
+                  if (pending?.toolName === "TaskCreate") {
+                    try {
+                      const taskInput = pending.input as Record<string, unknown>;
+                      const taskData = {
+                        id: (JSON.parse(resultContent) as any)?.id || String(Date.now()),
+                        subject: taskInput?.subject as string || "",
+                        description: taskInput?.description as string || "",
+                        activeForm: taskInput?.activeForm as string,
+                        status: "pending" as const,
+                        blocks: taskInput?.blocks as string[] | undefined,
+                        blockedBy: taskInput?.blockedBy as string[] | undefined,
+                      };
+                      publishEvent(workflow_id, "task_created", {
+                        task: taskData,
+                        toolCallId: toolResult.tool_use_id,
+                      }, "claude-code-agent");
+                    } catch {
+                      publishEvent(workflow_id, "task_created", {
+                        task: pending.input,
+                        toolCallId: toolResult.tool_use_id,
+                      }, "claude-code-agent");
+                    }
+                  } else if (pending?.toolName === "TaskUpdate") {
+                    const updateInput = pending.input as Record<string, unknown>;
+                    publishEvent(workflow_id, "task_updated", {
+                      taskId: updateInput?.taskId as string,
+                      taskStatus: updateInput?.status as string,
+                      toolCallId: toolResult.tool_use_id,
+                    }, "claude-code-agent");
+                  } else if (pending?.toolName === "ExitPlanMode") {
+                    publishEvent(workflow_id, "plan_complete", {
+                      toolCallId: toolResult.tool_use_id,
+                    }, "claude-code-agent");
+                  }
+                }
+                if (pending) {
+                  pendingToolCalls.delete(toolResult.tool_use_id);
+                }
+              }
             }
           }
         }
@@ -309,9 +558,10 @@ app.post("/execute", async (req, res) => {
 
     // Flush any remaining text
     if (workflow_id && textBuffer.length > 0) {
-      publishEvent(workflow_id, "llm_chunk", {
-        content: textBuffer,
+      publishEvent(workflow_id, "part", {
+        type: "text",
         text: textBuffer,
+        state: "done",
       }, "claude-code-agent");
     }
 
