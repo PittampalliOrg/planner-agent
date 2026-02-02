@@ -580,6 +580,21 @@ class ActivityTrackingInterceptor(BaseToolInterceptor):
 
         ctx.activities.append(activity)
 
+        # Publish tool_call event to pub/sub for real-time SSE streaming
+        try:
+            from app import publish_workflow_event
+            publish_workflow_event(
+                ctx.workflow_id,
+                "tool_call",
+                {
+                    "toolName": input.tool_name,
+                    "toolInput": self._serialize_input(clean_input),
+                    "content": f"Running: {input.tool_name}",
+                }
+            )
+        except Exception as e:
+            logger.debug(f"Could not publish tool_call event: {e}")
+
         # Helper to complete the activity
         def complete_activity(result: Any, error: Optional[str] = None):
             activity["endTime"] = datetime.now(timezone.utc).isoformat()
@@ -603,6 +618,26 @@ class ActivityTrackingInterceptor(BaseToolInterceptor):
 
             if self.update_callback:
                 self.update_callback(ctx.workflow_id, ctx.activities)
+
+            # Publish tool_result event to pub/sub for real-time SSE streaming
+            try:
+                from app import publish_workflow_event
+                output_str = str(activity.get("output", ""))
+                if len(output_str) > 500:
+                    output_str = output_str[:500] + "..."
+                publish_workflow_event(
+                    ctx.workflow_id,
+                    "tool_result",
+                    {
+                        "toolName": input.tool_name,
+                        "toolOutput": output_str,
+                        "status": activity["status"],
+                        "content": f"Result: {input.tool_name}",
+                        "durationMs": activity.get("durationMs", 0),
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Could not publish tool_result event: {e}")
 
         try:
             result = next(input)

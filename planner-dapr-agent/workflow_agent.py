@@ -14,16 +14,196 @@ Key design decisions:
 """
 
 import asyncio
+import contextvars
+import functools
+import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from pydantic import BaseModel, Field
 from agents import Agent, Runner, function_tool
 
+logger = logging.getLogger(__name__)
+
 # Default workspace directory
 DEFAULT_CWD = os.getenv("PLANNER_CWD", "/app/workspace")
+
+# Context variable to store current workflow_id for tool event publishing
+_current_workflow_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    'workflow_agent_workflow_id', default=None
+)
+
+
+def set_workflow_id(workflow_id: str) -> contextvars.Token:
+    """Set the current workflow ID for tool event publishing."""
+    return _current_workflow_id.set(workflow_id)
+
+
+def get_workflow_id() -> Optional[str]:
+    """Get the current workflow ID."""
+    return _current_workflow_id.get()
+
+
+def reset_workflow_id(token: contextvars.Token) -> None:
+    """Reset the workflow ID context."""
+    _current_workflow_id.reset(token)
+
+
+def _publish_tool_event(event_type: str, tool_name: str, data: dict) -> None:
+    """Publish a tool event to pub/sub for real-time SSE streaming."""
+    workflow_id = get_workflow_id()
+    if not workflow_id:
+        return
+
+    try:
+        from dapr_multi_step_workflow import publish_workflow_event
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type=event_type,
+            data=data,
+        )
+        logger.debug(f"Published {event_type} event for tool {tool_name}")
+    except Exception as e:
+        logger.debug(f"Could not publish {event_type} event: {e}")
+
+
+def _safe_serialize(value: Any, max_depth: int = 3) -> Any:
+    """Safely serialize a value for logging/publishing."""
+    if max_depth <= 0:
+        return str(value)[:200]
+
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:500] if len(value) > 500 else value
+
+    if isinstance(value, (list, tuple)):
+        if len(value) > 10:
+            return f"<{len(value)} items>"
+        return [_safe_serialize(v, max_depth - 1) for v in value]
+
+    if isinstance(value, dict):
+        result = {}
+        for k, v in list(value.items())[:10]:
+            result[str(k)] = _safe_serialize(v, max_depth - 1)
+        return result
+
+    return str(value)[:200]
+
+
+def tracked_tool(func: Callable) -> Any:
+    """Decorator that wraps a tool function to publish events.
+
+    Publishes tool_call when the tool starts and tool_result when it completes.
+    Falls back gracefully if publishing fails.
+    """
+    @functools.wraps(func)
+    async def async_wrapper(*args, **kwargs) -> Any:
+        tool_name = func.__name__
+
+        # Publish tool_call event
+        _publish_tool_event(
+            "tool_call",
+            tool_name,
+            {
+                "toolName": tool_name,
+                "toolInput": _safe_serialize(kwargs or args),
+                "content": f"Running: {tool_name}",
+            }
+        )
+
+        try:
+            # Execute the tool
+            result = await func(*args, **kwargs)
+
+            # Publish tool_result event
+            result_str = str(result)
+            if len(result_str) > 500:
+                result_str = result_str[:500] + "..."
+            _publish_tool_event(
+                "tool_result",
+                tool_name,
+                {
+                    "toolName": tool_name,
+                    "toolOutput": result_str,
+                    "status": "completed",
+                    "content": f"Result: {tool_name}",
+                }
+            )
+
+            return result
+        except Exception as e:
+            # Publish error event
+            _publish_tool_event(
+                "tool_result",
+                tool_name,
+                {
+                    "toolName": tool_name,
+                    "toolOutput": str(e),
+                    "status": "failed",
+                    "content": f"Error: {tool_name}",
+                }
+            )
+            raise
+
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs) -> Any:
+        tool_name = func.__name__
+
+        # Publish tool_call event
+        _publish_tool_event(
+            "tool_call",
+            tool_name,
+            {
+                "toolName": tool_name,
+                "toolInput": _safe_serialize(kwargs or args),
+                "content": f"Running: {tool_name}",
+            }
+        )
+
+        try:
+            # Execute the tool
+            result = func(*args, **kwargs)
+
+            # Publish tool_result event
+            result_str = str(result)
+            if len(result_str) > 500:
+                result_str = result_str[:500] + "..."
+            _publish_tool_event(
+                "tool_result",
+                tool_name,
+                {
+                    "toolName": tool_name,
+                    "toolOutput": result_str,
+                    "status": "completed",
+                    "content": f"Result: {tool_name}",
+                }
+            )
+
+            return result
+        except Exception as e:
+            # Publish error event
+            _publish_tool_event(
+                "tool_result",
+                tool_name,
+                {
+                    "toolName": tool_name,
+                    "toolOutput": str(e),
+                    "status": "failed",
+                    "content": f"Error: {tool_name}",
+                }
+            )
+            raise
+
+    # Handle both async and sync functions
+    if asyncio.iscoroutinefunction(func):
+        return function_tool(async_wrapper)
+    else:
+        return function_tool(sync_wrapper)
 
 
 # ============================================================================
@@ -80,7 +260,7 @@ class TestResult(BaseModel):
 # Planning Phase Tools
 # ============================================================================
 
-@function_tool
+@tracked_tool
 async def research(query: str) -> str:
     """Search codebase or documentation for information needed to plan.
 
@@ -107,7 +287,7 @@ async def research(query: str) -> str:
         return f"Search error: {e}"
 
 
-@function_tool
+@tracked_tool
 async def think(thought: str) -> str:
     """Record a reasoning step. Use this to think through the problem.
 
@@ -120,7 +300,7 @@ async def think(thought: str) -> str:
     return f"Noted: {thought}"
 
 
-@function_tool
+@tracked_tool
 async def draft_plan(summary: str, tasks_json: str) -> str:
     """Draft or refine the plan. Call multiple times to iterate.
 
@@ -158,7 +338,7 @@ async def draft_plan(summary: str, tasks_json: str) -> str:
 # Execution Phase Tools
 # ============================================================================
 
-@function_tool
+@tracked_tool
 async def read_file(file_path: str) -> str:
     """Read contents of a file.
 
@@ -186,7 +366,7 @@ async def read_file(file_path: str) -> str:
         return f"Error reading {file_path}: {e}"
 
 
-@function_tool
+@tracked_tool
 async def write_file(file_path: str, content: str) -> str:
     """Write content to a file. Creates directories if needed.
 
@@ -212,7 +392,7 @@ async def write_file(file_path: str, content: str) -> str:
         return f"Error writing {file_path}: {e}"
 
 
-@function_tool
+@tracked_tool
 async def run_command(command: str) -> str:
     """Run a shell command. Use for builds, tests, etc.
 
@@ -239,7 +419,7 @@ async def run_command(command: str) -> str:
         return f"Error: {e}"
 
 
-@function_tool
+@tracked_tool
 async def mark_task_complete(task_id: str, notes: str = "") -> str:
     """Mark a task as complete. Call after finishing each task.
 
@@ -257,7 +437,7 @@ async def mark_task_complete(task_id: str, notes: str = "") -> str:
 # Testing Phase Tools
 # ============================================================================
 
-@function_tool
+@tracked_tool
 async def run_tests(command: str) -> str:
     """Run test command (pytest, npm test, etc.).
 
@@ -284,7 +464,7 @@ async def run_tests(command: str) -> str:
         return f"Error running tests: {e}"
 
 
-@function_tool
+@tracked_tool
 async def verify_output(task_id: str, expected: str, actual: str) -> str:
     """Verify a task's output matches expectations.
 
@@ -302,7 +482,7 @@ async def verify_output(task_id: str, expected: str, actual: str) -> str:
     return f"Task {task_id}: FAIL - Expected '{expected[:100]}' not found in output"
 
 
-@function_tool
+@tracked_tool
 async def check_file_exists(file_path: str) -> str:
     """Check if a file was created/modified as expected.
 

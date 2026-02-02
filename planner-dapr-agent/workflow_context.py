@@ -205,11 +205,35 @@ class WorkflowContext:
         )
 
         self._token: Optional[contextvars.Token] = None
+        self._durable_runner_token: Optional[contextvars.Token] = None
 
     async def __aenter__(self) -> 'WorkflowContext':
         """Enter the context."""
         # Set as current context
         self._token = _current_context.set(self)
+
+        # Also set the durable_runner context for interceptor compatibility
+        # This ensures ActivityTrackingInterceptor can publish tool events
+        try:
+            from durable_runner import (
+                WorkflowExecutionContext as DurableContext,
+                set_workflow_context as set_durable_context,
+            )
+            # Create a compatible context for durable_runner
+            durable_ctx = DurableContext(
+                workflow_id=self.workflow_id,
+                metadata=self.state.metadata or {},
+                activities=self.state.activities,  # Share the same list
+                tasks=self.state.tasks,  # Share the same list
+                task_counter=self.state.task_counter,
+                trace_id=self.state.trace_id,
+                workflow_name=self.state.workflow_name,
+                agent_span_id=self.state.agent_span_id,
+            )
+            self._durable_runner_token = set_durable_context(durable_ctx)
+            logger.debug(f"Set durable_runner context for workflow {self.workflow_id}")
+        except Exception as e:
+            logger.warning(f"Could not set durable_runner context: {e}")
 
         # Try to recover existing state
         existing = self._load_state()
@@ -231,9 +255,17 @@ class WorkflowContext:
         # Persist final state
         self._save_state()
 
-        # Clear context
+        # Clear contexts
         if self._token:
             _current_context.reset(self._token)
+
+        # Clear durable_runner context
+        if self._durable_runner_token:
+            try:
+                from durable_runner import _workflow_context as durable_context_var
+                durable_context_var.reset(self._durable_runner_token)
+            except Exception as e:
+                logger.debug(f"Could not reset durable_runner context: {e}")
 
         return False  # Don't suppress exceptions
 

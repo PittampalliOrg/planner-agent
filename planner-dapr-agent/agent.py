@@ -9,16 +9,133 @@ Dapr integration is handled separately via WorkflowContext and interceptors,
 keeping the agent definition clean and SDK-native.
 """
 
+import functools
 import glob
+import logging
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from agents import Agent, function_tool
 
+logger = logging.getLogger(__name__)
+
 # Default workspace directory
 DEFAULT_CWD = os.getenv("PLANNER_CWD", "/app/workspace")
+
+
+def _publish_tool_event(event_type: str, tool_name: str, data: dict) -> None:
+    """Publish a tool event to pub/sub for real-time SSE streaming.
+
+    This is called by tool wrappers to publish tool_call and tool_result events.
+    """
+    try:
+        # Get workflow context to get workflow_id
+        ctx = _get_context()
+        if not ctx:
+            return
+
+        workflow_id = getattr(ctx, 'workflow_id', None)
+        if not workflow_id:
+            return
+
+        # Import and call publish function
+        from app import publish_workflow_event
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type=event_type,
+            data=data,
+        )
+        logger.debug(f"Published {event_type} event for tool {tool_name}")
+    except Exception as e:
+        logger.debug(f"Could not publish {event_type} event: {e}")
+
+
+def tracked_tool(func: Callable) -> Any:
+    """Decorator that wraps a tool function to publish events.
+
+    Publishes tool_call when the tool starts and tool_result when it completes.
+    Falls back gracefully if publishing fails.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        tool_name = func.__name__
+
+        # Publish tool_call event
+        _publish_tool_event(
+            "tool_call",
+            tool_name,
+            {
+                "toolName": tool_name,
+                "toolInput": _safe_serialize(kwargs or args),
+                "content": f"Running: {tool_name}",
+            }
+        )
+
+        try:
+            # Execute the tool
+            result = func(*args, **kwargs)
+
+            # Publish tool_result event
+            result_str = str(result)
+            if len(result_str) > 500:
+                result_str = result_str[:500] + "..."
+            _publish_tool_event(
+                "tool_result",
+                tool_name,
+                {
+                    "toolName": tool_name,
+                    "toolOutput": result_str,
+                    "status": "completed",
+                    "content": f"Result: {tool_name}",
+                }
+            )
+
+            return result
+        except Exception as e:
+            # Publish error event
+            _publish_tool_event(
+                "tool_result",
+                tool_name,
+                {
+                    "toolName": tool_name,
+                    "toolOutput": str(e),
+                    "status": "failed",
+                    "content": f"Error: {tool_name}",
+                }
+            )
+            raise
+
+    # Apply @function_tool decorator
+    return function_tool(wrapper)
+
+
+def _safe_serialize(value: Any, max_depth: int = 3) -> Any:
+    """Safely serialize a value for logging/publishing."""
+    if max_depth <= 0:
+        return str(value)[:200]
+
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:500] if len(value) > 500 else value
+
+    if isinstance(value, (list, tuple)):
+        if len(value) > 10:
+            return f"<{len(value)} items>"
+        return [_safe_serialize(v, max_depth - 1) for v in value]
+
+    if isinstance(value, dict):
+        result = {}
+        for k, v in list(value.items())[:10]:
+            result[str(k)] = _safe_serialize(v, max_depth - 1)
+        return result
+
+    return str(value)[:200]
 
 
 # =============================================================================
@@ -44,7 +161,7 @@ def _get_context():
     return get_workflow_context()
 
 
-@function_tool
+@tracked_tool
 def create_task(subject: str, description: str, blocked_by: Optional[List[str]] = None) -> dict:
     """Create a planning task with dependencies.
 
@@ -83,7 +200,7 @@ def create_task(subject: str, description: str, blocked_by: Optional[List[str]] 
     return {"id": task_id, "subject": subject, "status": "pending"}
 
 
-@function_tool
+@tracked_tool
 def list_tasks() -> str:
     """List all created tasks.
 
@@ -99,7 +216,7 @@ def list_tasks() -> str:
     return "\n".join(f"[{t['id']}] {t['subject']}" for t in tasks)
 
 
-@function_tool
+@tracked_tool
 def get_tasks_json() -> dict:
     """Get all tasks as JSON for the workflow response.
 
@@ -111,7 +228,7 @@ def get_tasks_json() -> dict:
     return {"tasks": tasks, "count": len(tasks)}
 
 
-@function_tool
+@tracked_tool
 def read_file(file_path: str) -> dict:
     """Read file contents from workspace.
 
@@ -131,7 +248,7 @@ def read_file(file_path: str) -> dict:
         return {"content": "", "exists": False}
 
 
-@function_tool
+@tracked_tool
 def write_file(file_path: str, content: str) -> str:
     """Write content to a file in the workspace.
 
@@ -153,7 +270,7 @@ def write_file(file_path: str, content: str) -> str:
     return f"Successfully wrote {len(content)} bytes to {file_path}"
 
 
-@function_tool
+@tracked_tool
 def list_directory(path: str = ".") -> dict:
     """List files and directories in workspace.
 
@@ -172,7 +289,7 @@ def list_directory(path: str = ".") -> dict:
     return {"files": files[:50], "directories": dirs[:20], "count": len(items)}
 
 
-@function_tool
+@tracked_tool
 def run_shell_command(command: str) -> str:
     """Execute a shell command in the workspace.
 
@@ -196,7 +313,7 @@ def run_shell_command(command: str) -> str:
     return output if output else f"Command completed with exit code {result.returncode}"
 
 
-@function_tool
+@tracked_tool
 def search_code(pattern: str, path: str = ".") -> str:
     """Search for a pattern in code files using grep.
 

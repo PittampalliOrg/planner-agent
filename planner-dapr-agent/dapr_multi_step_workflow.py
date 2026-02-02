@@ -42,7 +42,10 @@ def publish_workflow_event(
     data: dict,
     task_id: Optional[str] = None,
 ) -> bool:
-    """Publish a workflow event to the Dapr pub/sub topic for ai-chatbot."""
+    """Publish a workflow event to the Dapr pub/sub topic for ai-chatbot.
+
+    Also buffers the event for replay when SSE streams connect (solves race condition).
+    """
     event = {
         "id": f"workflow-{workflow_id}-{uuid.uuid4().hex[:8]}",
         "type": event_type,
@@ -53,6 +56,14 @@ def publish_workflow_event(
     }
     if task_id:
         event["taskId"] = task_id
+
+    # Buffer event for SSE replay (import lazily to avoid circular imports)
+    if event_type not in ("heartbeat", "ping"):
+        try:
+            from app import _buffer_event
+            _buffer_event(workflow_id, event)
+        except Exception as e:
+            logger.debug(f"Could not buffer event: {e}")
 
     try:
         pubsub_name = _get_pubsub_name()
@@ -239,13 +250,20 @@ def planning_activity(ctx: wf.WorkflowActivityContext, input_data: Dict[str, Any
     })
 
     async def run_planning():
-        planning_agent = create_planning_agent(model)
-        plan_result = await Runner.run(
-            planning_agent,
-            input=task,
-            max_turns=max_turns,
-        )
-        plan: Plan = plan_result.final_output
+        # Set workflow context for tool event publishing
+        from workflow_agent import set_workflow_id, reset_workflow_id
+        token = set_workflow_id(workflow_id)
+        try:
+            planning_agent = create_planning_agent(model)
+            plan_result = await Runner.run(
+                planning_agent,
+                input=task,
+                max_turns=max_turns,
+            )
+            plan: Plan = plan_result.final_output
+        finally:
+            reset_workflow_id(token)
+
 
         # Auto-populate blocks based on blockedBy
         task_map = {t.id: t for t in plan.tasks}
@@ -323,9 +341,13 @@ def execution_activity(ctx: wf.WorkflowActivityContext, input_data: Dict[str, An
     })
 
     async def run_execution():
-        execution_agent = create_execution_agent(model)
+        # Set workflow context for tool event publishing
+        from workflow_agent import set_workflow_id, reset_workflow_id
+        token = set_workflow_id(workflow_id)
+        try:
+            execution_agent = create_execution_agent(model)
 
-        exec_prompt = f"""Execute this plan:
+            exec_prompt = f"""Execute this plan:
 
 Summary: {plan.get('summary', '')}
 
@@ -334,13 +356,15 @@ Tasks:
 
 Reasoning: {plan.get('reasoning', '')}"""
 
-        exec_result = await Runner.run(
-            execution_agent,
-            input=exec_prompt,
-            max_turns=max_turns,
-        )
-        execution: ExecutionResult = exec_result.final_output
-        return execution.model_dump()
+            exec_result = await Runner.run(
+                execution_agent,
+                input=exec_prompt,
+                max_turns=max_turns,
+            )
+            execution: ExecutionResult = exec_result.final_output
+            return execution.model_dump()
+        finally:
+            reset_workflow_id(token)
 
     try:
         execution_data = asyncio.run(run_execution())
@@ -410,9 +434,13 @@ def testing_activity(ctx: wf.WorkflowActivityContext, input_data: Dict[str, Any]
     })
 
     async def run_testing():
-        testing_agent = create_testing_agent(model)
+        # Set workflow context for tool event publishing
+        from workflow_agent import set_workflow_id, reset_workflow_id
+        token = set_workflow_id(workflow_id)
+        try:
+            testing_agent = create_testing_agent(model)
 
-        test_prompt = f"""Verify the implementation:
+            test_prompt = f"""Verify the implementation:
 
 Plan Summary: {plan.get('summary', '')}
 
@@ -422,22 +450,24 @@ Test Cases:
 Execution Summary: {execution.get('output', '')}
 Completed Tasks: {execution.get('completed_tasks', [])}"""
 
-        test: TestResult = TestResult(
-            passed=False, tests_run=0, tests_passed=0, tests_failed=0,
-            failures=[], summary="Tests not yet run"
-        )
-
-        for attempt in range(max_test_retries):
-            test_result = await Runner.run(
-                testing_agent,
-                input=test_prompt,
-                max_turns=max_turns,
+            test: TestResult = TestResult(
+                passed=False, tests_run=0, tests_passed=0, tests_failed=0,
+                failures=[], summary="Tests not yet run"
             )
-            test = test_result.final_output
-            if test.passed:
-                break
 
-        return test.model_dump()
+            for attempt in range(max_test_retries):
+                test_result = await Runner.run(
+                    testing_agent,
+                    input=test_prompt,
+                    max_turns=max_turns,
+                )
+                test = test_result.final_output
+                if test.passed:
+                    break
+
+            return test.model_dump()
+        finally:
+            reset_workflow_id(token)
 
     try:
         test_data = asyncio.run(run_testing())

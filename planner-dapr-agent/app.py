@@ -111,6 +111,33 @@ PUBSUB_NAME = "pubsub"
 PUBSUB_TOPIC = "workflow.stream"
 AGENT_ID = "planner-dapr-agent"
 
+# Event buffer for replaying events on SSE connect
+# This solves the race condition where events are published before SSE stream connects
+_event_buffer: dict[str, list[dict]] = {}
+_event_buffer_lock = threading.Lock()
+MAX_EVENTS_PER_WORKFLOW = 200  # Limit buffer size
+
+def _buffer_event(workflow_id: str, event: dict) -> None:
+    """Buffer an event for later replay on SSE connect."""
+    with _event_buffer_lock:
+        if workflow_id not in _event_buffer:
+            _event_buffer[workflow_id] = []
+        _event_buffer[workflow_id].append(event)
+        # Trim if too large
+        if len(_event_buffer[workflow_id]) > MAX_EVENTS_PER_WORKFLOW:
+            _event_buffer[workflow_id] = _event_buffer[workflow_id][-MAX_EVENTS_PER_WORKFLOW:]
+
+def _get_buffered_events(workflow_id: str) -> list[dict]:
+    """Get buffered events for a workflow."""
+    with _event_buffer_lock:
+        return list(_event_buffer.get(workflow_id, []))
+
+def _clear_event_buffer(workflow_id: str) -> None:
+    """Clear buffered events for a workflow (after completion)."""
+    with _event_buffer_lock:
+        if workflow_id in _event_buffer:
+            del _event_buffer[workflow_id]
+
 # Workflow index configuration (for ai-chatbot listing)
 WORKFLOW_INDEX_STORE = "ai-chatbot-statestore"
 WORKFLOW_INDEX_KEY = "workflow-patterns-index"
@@ -149,6 +176,8 @@ def track_activity(
     from durable_runner.py. Activity tracking is now primarily handled by
     the ActivityTrackingInterceptor, but this function is kept for backward
     compatibility and for tracking non-tool activities (like agent:run).
+
+    Also publishes events to pub/sub for real-time SSE streaming.
     """
     ctx = get_workflow_context()
     if not ctx:
@@ -176,6 +205,9 @@ def track_activity(
             existing["output"] = output_data
         # Only persist on completion to avoid race conditions
         update_workflow_activities(ctx.workflow_id, ctx.activities)
+
+        # Publish completion event for real-time streaming
+        _publish_activity_event(ctx.workflow_id, name, status, input_data, output_data, existing.get("durationMs"))
     else:
         # Create new activity
         activity = {
@@ -189,6 +221,56 @@ def track_activity(
             activity["output"] = output_data
         ctx.activities.append(activity)
         # Don't persist "running" status - wait for completion to avoid race conditions
+
+        # Publish start event for real-time streaming
+        _publish_activity_event(ctx.workflow_id, name, status, input_data, output_data)
+
+
+def _publish_activity_event(
+    workflow_id: str,
+    name: str,
+    status: str,
+    input_data: Optional[dict] = None,
+    output_data: Optional[dict] = None,
+    duration_ms: Optional[int] = None,
+) -> None:
+    """Publish activity event to pub/sub for real-time SSE streaming."""
+    # Determine event type based on activity name and status
+    if name.startswith("llm:"):
+        if status == "running":
+            event_type = "llm_start"
+            data = {"llm_call": name, "input": input_data}
+        else:
+            event_type = "llm_end"
+            data = {"llm_call": name, "output": output_data, "durationMs": duration_ms}
+    elif name.startswith("tool:") or name in ("create_task", "list_tasks", "get_tasks_json", "read_file", "write_file", "list_directory", "run_shell_command", "search_code"):
+        tool_name = name.replace("tool:", "") if name.startswith("tool:") else name
+        if status == "running":
+            event_type = "tool_call"
+            data = {"toolName": tool_name, "toolInput": input_data}
+        else:
+            event_type = "tool_result"
+            data = {"toolName": tool_name, "toolOutput": output_data, "status": status, "durationMs": duration_ms}
+    elif name.startswith("agent:"):
+        if status == "running":
+            event_type = "agent_started"
+            data = {"agent": name, "input": input_data}
+        else:
+            event_type = "agent_completed"
+            data = {"agent": name, "output": output_data, "status": status, "durationMs": duration_ms}
+    else:
+        # Generic activity
+        if status == "running":
+            event_type = "activity_started"
+        else:
+            event_type = "activity_completed"
+        data = {"activity": name, "status": status, "input": input_data, "output": output_data, "durationMs": duration_ms}
+
+    # Use local import to avoid circular dependency
+    try:
+        publish_workflow_event(workflow_id, event_type, data)
+    except Exception as e:
+        logger.debug(f"Could not publish activity event: {e}")
 
 
 def reset_workflow_context(workflow_id: str) -> None:
@@ -1054,7 +1136,10 @@ def publish_workflow_event(
     data: dict,
     task_id: Optional[str] = None,
 ) -> bool:
-    """Publish a workflow event to the Dapr pub/sub topic for ai-chatbot."""
+    """Publish a workflow event to the Dapr pub/sub topic for ai-chatbot.
+
+    Also buffers the event for replay when SSE streams connect (solves race condition).
+    """
     event = {
         "id": f"dapr-agent-{workflow_id}-{uuid.uuid4().hex[:8]}",
         "type": event_type,
@@ -1065,6 +1150,10 @@ def publish_workflow_event(
     }
     if task_id:
         event["taskId"] = task_id
+
+    # Buffer the event for SSE replay (don't buffer heartbeats)
+    if event_type not in ("heartbeat", "ping"):
+        _buffer_event(workflow_id, event)
 
     try:
         with DaprClient() as client:
@@ -2174,6 +2263,18 @@ async def _stream_workflow_events(workflow_id: str, request: Request):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         yield f"data: {json.dumps(initial_event)}\n\n"
+        await asyncio.sleep(0)  # Force flush to client
+
+        # ============================================================
+        # Replay buffered events (solves race condition)
+        # Events published before SSE connect are buffered and replayed here
+        # ============================================================
+        buffered_events = _get_buffered_events(workflow_id)
+        if buffered_events:
+            logger.info(f"[Stream] Replaying {len(buffered_events)} buffered events for {workflow_id}")
+            for event in buffered_events:
+                yield f"data: {json.dumps(event)}\n\n"
+                await asyncio.sleep(0)  # Force flush
 
         # Fetch workflow state which includes activity history
         try:
@@ -2206,6 +2307,7 @@ async def _stream_workflow_events(workflow_id: str, request: Request):
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
                 yield f"data: {json.dumps(status_event)}\n\n"
+                await asyncio.sleep(0)  # Force flush to client
 
                 # Check if workflow is already completed
                 if runtime_status in ["COMPLETED", "FAILED", "TERMINATED"]:
@@ -2220,6 +2322,7 @@ async def _stream_workflow_events(workflow_id: str, request: Request):
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                     yield f"data: {json.dumps(done_event)}\n\n"
+                    await asyncio.sleep(0)  # Force flush to client
                     return  # Stream ends for completed workflows
 
         except Exception as e:
@@ -2277,6 +2380,7 @@ async def _stream_workflow_events(workflow_id: str, request: Request):
                     phase = event.get("data", {}).get("phase", "")
                     if phase == "completed" or event_type == "execution_completed":
                         yield f"data: {json.dumps(event)}\n\n"
+                        await asyncio.sleep(0)  # Force flush to client
                         # Send done marker
                         done_event = {
                             "id": f"done-{uuid.uuid4().hex[:8]}",
@@ -2286,9 +2390,11 @@ async def _stream_workflow_events(workflow_id: str, request: Request):
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
                         yield f"data: {json.dumps(done_event)}\n\n"
+                        await asyncio.sleep(0)  # Force flush to client
                         break
 
                 yield f"data: {json.dumps(event)}\n\n"
+                await asyncio.sleep(0)  # Force flush to client
 
             except Empty:
                 timeout_count += 1
@@ -2301,6 +2407,7 @@ async def _stream_workflow_events(workflow_id: str, request: Request):
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                     yield f"data: {json.dumps(heartbeat)}\n\n"
+                    await asyncio.sleep(0)  # Force flush to client
 
     finally:
         # Cleanup
