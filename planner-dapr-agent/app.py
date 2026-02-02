@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
-"""DurableAgent with AgentRunner.serve() using DaprChatClient."""
+"""Planner Agent using OpenAI Agents SDK with Dapr durability.
+
+This module provides the FastAPI application that exposes the planner agent.
+
+Architecture:
+- agent.py: Pure OpenAI Agents SDK agent definition (@function_tool, Agent)
+- workflow_context.py: WorkflowContext for activity tracking and state management
+- durable_runner.py: Interceptor-based durability (PR #827 pattern)
+- app.py: FastAPI endpoints and workflow orchestration
+
+Execution modes:
+- durable=false: Standard Runner.run() with basic activity tracking
+- durable=true: WorkflowContext-wrapped execution with full durability
+"""
 
 import asyncio
+import functools
+import glob
+import inspect
 import json
 import logging
 import os
+import subprocess
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Callable, List, Optional
 
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, BackgroundTasks
@@ -16,37 +35,616 @@ import uvicorn
 from dotenv import load_dotenv
 from dapr.clients import DaprClient
 
-from dapr_agents import DurableAgent, tool
-from dapr_agents.workflow.runners import AgentRunner
-from dapr_agents.agents.configs import AgentMemoryConfig, AgentStateConfig, AgentExecutionConfig
-from dapr_agents.memory import ConversationDaprStateMemory
-from dapr_agents.storage.daprstores.stateservice import StateStoreService
-from dapr_agents.llm import OpenAIChatClient
+from agents import Agent, Runner, function_tool
+from agents.run import RunHooks
+from agents.tool import FunctionTool
+
+# Try to import official DaprSession for conversation memory (OpenAI Agents SDK extension)
+try:
+    from agents.extensions.memory.dapr_session import DaprSession as OfficialDaprSession
+    OFFICIAL_DAPR_SESSION_AVAILABLE = True
+except ImportError:
+    OFFICIAL_DAPR_SESSION_AVAILABLE = False
+    OfficialDaprSession = None
+
+# Try to import DaprOpenAIRunner for true workflow durability
+try:
+    from dapr_openai_runner import (
+        DaprOpenAIRunner,
+        build_runtime,
+        get_or_create_runner,
+        run_durable_agent,
+        is_dapr_workflow_available,
+        WorkflowResult,
+    )
+    DAPR_WORKFLOW_RUNNER_AVAILABLE = is_dapr_workflow_available()
+except ImportError:
+    DAPR_WORKFLOW_RUNNER_AVAILABLE = False
+    DaprOpenAIRunner = None
+    build_runtime = None
+    get_or_create_runner = None
+    run_durable_agent = None
+    is_dapr_workflow_available = None
+    WorkflowResult = None
 
 from dapr_config import initialize_config_and_secrets, get_config, get_secret_value, is_dapr_enabled
+
+# Import agent definition (clean OpenAI SDK pattern)
+from agent import create_planner_agent
+
+# Import WorkflowContext for activity tracking (renamed from dapr_session)
+from workflow_context import WorkflowContext, get_session_state
+
+# Import interceptor framework (for backward compatibility)
+from durable_runner import (
+    WorkflowExecutionContext,
+    DurableRunResult,
+    get_workflow_context,
+    set_workflow_context,
+    DurableAgentRunner,
+    ActivityTrackingInterceptor,
+)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Pub/sub configuration for ai-chatbot integration
-# These are initialized after config provider setup
-PUBSUB_NAME = "pubsub"  # Updated after init
-PUBSUB_TOPIC = "workflow.stream"  # Updated after init
+PUBSUB_NAME = "pubsub"
+PUBSUB_TOPIC = "workflow.stream"
 AGENT_ID = "planner-dapr-agent"
 
 # Workflow index configuration (for ai-chatbot listing)
-# Uses the same state store format as ai-chatbot's workflow-patterns index
-# Must use ai-chatbot-statestore to write to the same Redis as ai-chatbot
-WORKFLOW_INDEX_STORE = "ai-chatbot-statestore"  # Updated after init
+WORKFLOW_INDEX_STORE = "ai-chatbot-statestore"
 WORKFLOW_INDEX_KEY = "workflow-patterns-index"
 WORKFLOW_KEY_PREFIX = "workflow-pattern-"
 
 DEFAULT_CWD = os.getenv("PLANNER_CWD", "/app/workspace")
 
-# Task storage (reset per workflow via workflow input)
-_task_counter = 0
-_tasks: List[dict] = []
+
+# ============================================================================
+# Activity Tracking Helpers (using interceptor framework)
+# ============================================================================
+
+def track_activity(
+    name: str,
+    status: str,
+    input_data: Optional[dict] = None,
+    output_data: Optional[dict] = None,
+) -> None:
+    """Track tool/activity execution for ai-chatbot visualization.
+
+    This is a helper function that works with the WorkflowExecutionContext
+    from durable_runner.py. Activity tracking is now primarily handled by
+    the ActivityTrackingInterceptor, but this function is kept for backward
+    compatibility and for tracking non-tool activities (like agent:run).
+    """
+    ctx = get_workflow_context()
+    if not ctx:
+        logger.debug(f"No workflow context for activity: {name}")
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Find existing activity or create new one
+    existing = None
+    for activity in ctx.activities:
+        if activity["activityName"] == name and activity["status"] == "running":
+            existing = activity
+            break
+
+    if existing and status in ("completed", "failed"):
+        # Update existing activity
+        existing["status"] = status
+        existing["endTime"] = now
+        if existing.get("startTime"):
+            start = datetime.fromisoformat(existing["startTime"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            existing["durationMs"] = int((end - start).total_seconds() * 1000)
+        if output_data:
+            existing["output"] = output_data
+        # Only persist on completion to avoid race conditions
+        update_workflow_activities(ctx.workflow_id, ctx.activities)
+    else:
+        # Create new activity
+        activity = {
+            "activityName": name,
+            "status": status,
+            "startTime": now,
+        }
+        if input_data:
+            activity["input"] = input_data
+        if output_data:
+            activity["output"] = output_data
+        ctx.activities.append(activity)
+        # Don't persist "running" status - wait for completion to avoid race conditions
+
+
+def reset_workflow_context(workflow_id: str) -> None:
+    """Initialize workflow context for a new workflow run.
+
+    Creates a new WorkflowExecutionContext and sets it as the current context.
+    """
+    ctx = WorkflowExecutionContext(
+        workflow_id=workflow_id,
+        metadata={"workflow_id": workflow_id},
+    )
+    set_workflow_context(ctx)
+
+
+# ============================================================================
+# Legacy Interceptor Support
+# ============================================================================
+#
+# The ActivityTrackingInterceptor is now imported from durable_runner.py.
+# This provides backward compatibility while using the new interceptor framework.
+#
+# For new code, prefer using DurableAgentRunner which automatically wraps tools
+# with the interceptor chain. The @tracked_tool decorator below provides a
+# simpler alternative for individual tools.
+
+# Global interceptor instance using the new framework (can be configured/replaced)
+# ActivityTrackingInterceptor is imported from durable_runner.py
+_tool_interceptor = ActivityTrackingInterceptor(update_callback=None)
+
+
+def _serialize_arg(arg: Any, max_length: int = 500) -> Any:
+    """Serialize argument for activity tracking, truncating large values."""
+    if isinstance(arg, str):
+        return arg[:max_length] if len(arg) > max_length else arg
+    if isinstance(arg, (int, float, bool, type(None))):
+        return arg
+    if isinstance(arg, (list, tuple)):
+        return [_serialize_arg(x, max_length) for x in arg[:10]]
+    if isinstance(arg, dict):
+        return {k: _serialize_arg(v, max_length) for k, v in list(arg.items())[:10]}
+    return str(arg)[:200]
+
+
+def _serialize_output(result: Any) -> dict:
+    """Serialize function output for activity tracking."""
+    if isinstance(result, dict):
+        output = {}
+        for key in list(result.keys())[:10]:
+            val = result[key]
+            if isinstance(val, str) and len(val) > 100:
+                output[key] = f"<{len(val)} chars>"
+            elif isinstance(val, list):
+                output[key] = f"<{len(val)} items>"
+            elif isinstance(val, (int, float, bool, type(None))):
+                output[key] = val
+            else:
+                output[key] = str(val)[:100]
+        return output
+    if isinstance(result, str):
+        return {"length": len(result), "preview": result[:100] if len(result) > 100 else result}
+    return {"type": type(result).__name__}
+
+
+def tracked_tool(func: Callable) -> FunctionTool:
+    """Interceptor decorator that wraps a function with automatic activity tracking.
+
+    This decorator implements the interceptor pattern from dapr/python-sdk PR #827,
+    adapted for the OpenAI Agents SDK. It:
+
+    1. Creates an ExecuteToolRequest with input metadata (like PR #827's request objects)
+    2. Passes the request through the interceptor chain
+    3. The interceptor handles tracking start/completion/failure
+
+    Usage:
+        @tracked_tool
+        def my_tool(arg1: str, arg2: int) -> dict:
+            '''Tool description for the LLM.'''
+            return {"result": arg1 * arg2}
+
+    The decorator applies @function_tool internally, so you only need @tracked_tool.
+
+    To customize interception, replace the global _tool_interceptor.
+
+    Note: For new code, prefer using DurableAgentRunner which provides full
+    durability support. This decorator provides a simpler alternative for
+    backward compatibility.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        # Build input data from function signature (like PR #827's request.input)
+        input_data = {"args": args, "kwargs": kwargs}
+        try:
+            sig = inspect.signature(func)
+            param_names = list(sig.parameters.keys())
+            serialized = {}
+            for i, arg in enumerate(args):
+                if i < len(param_names):
+                    serialized[param_names[i]] = _serialize_arg(arg)
+            serialized.update({k: _serialize_arg(v) for k, v in kwargs.items()})
+            input_data["serialized"] = serialized
+        except Exception:
+            pass
+
+        # Get workflow context for metadata (like PR #827's metadata envelope)
+        ctx = get_workflow_context()
+
+        # Create request object (mirrors PR #827's ExecuteActivityRequest)
+        # Using the new ExecuteToolRequest structure with call_id and workflow_id
+        request = ExecuteToolRequest(
+            tool_name=func.__name__,
+            input=input_data,
+            metadata=ctx.metadata if ctx else None,
+            call_id=str(uuid.uuid4()),
+            workflow_id=ctx.workflow_id if ctx else None,
+        )
+
+        # Execute through interceptor (the actual function call)
+        def execute_func(req: ExecuteToolRequest) -> Any:
+            return func(*args, **kwargs)
+
+        return _tool_interceptor.execute_tool(request, execute_func)
+
+    # Apply function_tool decorator to the wrapper
+    return function_tool(wrapper)
+
+
+class ActivityTrackingHooks(RunHooks):
+    """RunHooks implementation that tracks LLM calls and agent lifecycle.
+
+    This follows PR #827's interceptor pattern by using the workflow context
+    for state management instead of global variables.
+
+    OpenAI Trace Schema Compatibility:
+    - Captures GenerationSpanData equivalent for each LLM call
+    - Tracks token usage and aggregates totals
+    - Creates span hierarchy with agent as parent
+
+    Note: Tool tracking is handled by the ActivityTrackingInterceptor via
+    the @tracked_tool decorator. These hooks capture LLM calls which provide
+    additional visibility into the agent's reasoning process.
+    """
+
+    def on_agent_start(self, context, agent) -> None:
+        """Called when agent execution starts."""
+        ctx = get_workflow_context()
+
+        # Set workflow name from agent
+        if ctx:
+            ctx.workflow_name = agent.name if hasattr(agent, 'name') else "Planner"
+
+        track_activity(
+            name="agent:run",
+            status="running",
+            input_data={
+                "agent_name": agent.name if hasattr(agent, 'name') else "Planner",
+                "model": agent.model if hasattr(agent, 'model') else "unknown",
+                # OpenAI AgentSpanData fields
+                "tools": [getattr(t, 'name', str(t)) for t in (agent.tools or [])[:10]],
+            },
+        )
+        logger.info(f"Agent started: {agent.name if hasattr(agent, 'name') else 'Planner'}")
+
+    def on_agent_end(self, context, agent, output) -> None:
+        """Called when agent execution completes."""
+        ctx = get_workflow_context()
+
+        # Summarize output
+        output_summary = {}
+        if output:
+            if isinstance(output, str):
+                output_summary = {"output_length": len(output), "output_preview": output[:200]}
+            elif isinstance(output, dict):
+                output_summary = {"output_keys": list(output.keys())[:10]}
+            else:
+                output_summary = {"output_type": type(output).__name__}
+
+        # Include aggregated usage if available
+        if ctx and ctx.usage:
+            output_summary["total_usage"] = ctx.usage
+
+        track_activity(
+            name="agent:run",
+            status="completed",
+            output_data=output_summary,
+        )
+        logger.info("Agent completed")
+
+    def on_llm_start(self, context, agent, system_prompt, input_items) -> None:
+        """Called when an LLM call starts."""
+        ctx = get_workflow_context()
+        if ctx:
+            ctx.llm_call_count += 1
+            llm_call_num = ctx.llm_call_count
+        else:
+            llm_call_num = 1
+
+        # Count message types
+        message_count = len(input_items) if input_items else 0
+
+        track_activity(
+            name=f"llm:call_{llm_call_num}",
+            status="running",
+            input_data={
+                "model": agent.model if hasattr(agent, 'model') else "unknown",
+                "message_count": message_count,
+                "has_system_prompt": bool(system_prompt),
+                # OpenAI GenerationSpanData fields
+                "span_type": "generation",
+            },
+        )
+        logger.debug(f"LLM call {llm_call_num} started with {message_count} messages")
+
+    def on_llm_end(self, context, agent, response) -> None:
+        """Called when an LLM call completes."""
+        ctx = get_workflow_context()
+        llm_call_num = ctx.llm_call_count if ctx else 1
+
+        # Extract response metadata
+        output_data = {
+            "response_type": type(response).__name__,
+            "span_type": "generation",
+        }
+
+        # Try to get token usage if available
+        if hasattr(response, 'usage') and response.usage:
+            input_tokens = getattr(response.usage, 'input_tokens', None) or getattr(response.usage, 'prompt_tokens', 0) or 0
+            output_tokens = getattr(response.usage, 'output_tokens', None) or getattr(response.usage, 'completion_tokens', 0) or 0
+
+            output_data["usage"] = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            }
+
+            # Aggregate usage in context
+            if ctx:
+                ctx.add_usage(input_tokens=input_tokens, output_tokens=output_tokens)
+
+        track_activity(
+            name=f"llm:call_{llm_call_num}",
+            status="completed",
+            output_data=output_data,
+        )
+        logger.debug(f"LLM call {llm_call_num} completed")
+
+
+# ============================================================================
+# Tools with @function_tool decorator
+# ============================================================================
+
+
+@tracked_tool
+def create_task(subject: str, description: str, blocked_by: Optional[List[str]] = None) -> dict:
+    """Create a planning task with dependencies.
+
+    Args:
+        subject: Brief task title
+        description: Detailed task description
+        blocked_by: List of task IDs that must complete before this task
+
+    Returns:
+        Created task info with id, subject, and status
+    """
+    ctx = get_workflow_context()
+    if not ctx:
+        return {"error": "No workflow context", "id": "0", "subject": subject, "status": "error"}
+
+    ctx.task_counter += 1
+    task_id = str(ctx.task_counter)
+    blocked_by = blocked_by or []
+
+    task = {
+        "id": task_id,
+        "subject": subject,
+        "description": description,
+        "status": "pending",
+        "blockedBy": blocked_by,
+        "blocks": [],
+    }
+    ctx.tasks.append(task)
+
+    # Update blocks for dependent tasks
+    for dep_id in blocked_by:
+        for t in ctx.tasks:
+            if t["id"] == dep_id:
+                t["blocks"].append(task_id)
+
+    logger.info(f"Created task {task_id}: {subject}")
+    return {"id": task_id, "subject": subject, "status": "pending"}
+
+
+@tracked_tool
+def list_tasks() -> str:
+    """List all created tasks.
+
+    Returns:
+        Formatted string of all tasks with their IDs and subjects
+    """
+    ctx = get_workflow_context()
+    tasks = ctx.tasks if ctx else []
+
+    if not tasks:
+        return "No tasks created yet."
+
+    return "\n".join(f"[{t['id']}] {t['subject']}" for t in tasks)
+
+
+@tracked_tool
+def get_tasks_json() -> dict:
+    """Get all tasks as JSON for the workflow response.
+
+    Returns:
+        Dictionary with tasks array and count
+    """
+    ctx = get_workflow_context()
+    tasks = ctx.tasks if ctx else []
+    return {"tasks": tasks, "count": len(tasks)}
+
+
+@tracked_tool
+def read_file(file_path: str) -> dict:
+    """Read file contents from workspace.
+
+    Args:
+        file_path: Path relative to workspace directory
+
+    Returns:
+        Dictionary with content and exists flag
+    """
+    full_path = os.path.join(DEFAULT_CWD, file_path)
+
+    if os.path.exists(full_path):
+        with open(full_path, 'r') as f:
+            content = f.read()[:10000]  # Limit to 10KB
+        return {"content": content, "exists": True}
+    else:
+        return {"content": "", "exists": False}
+
+
+@tracked_tool
+def write_file(file_path: str, content: str) -> str:
+    """Write content to a file in the workspace.
+
+    Args:
+        file_path: Path relative to workspace directory
+        content: Content to write
+
+    Returns:
+        Success message or error
+    """
+    full_path = os.path.join(DEFAULT_CWD, file_path)
+
+    # Create parent directories if needed
+    Path(full_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(full_path, 'w') as f:
+        f.write(content)
+
+    return f"Successfully wrote {len(content)} bytes to {file_path}"
+
+
+@tracked_tool
+def list_directory(path: str = ".") -> dict:
+    """List files and directories in workspace.
+
+    Args:
+        path: Path relative to workspace directory (default: root)
+
+    Returns:
+        Dictionary with files, directories, and count
+    """
+    full_path = os.path.join(DEFAULT_CWD, path)
+
+    items = glob.glob(os.path.join(full_path, "*"))
+    files = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isfile(p)]
+    dirs = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isdir(p)]
+
+    return {"files": files[:50], "directories": dirs[:20], "count": len(items)}
+
+
+@tracked_tool
+def run_shell_command(command: str) -> str:
+    """Execute a shell command in the workspace.
+
+    Args:
+        command: Shell command to execute
+
+    Returns:
+        Command output or error message
+    """
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=DEFAULT_CWD,
+        capture_output=True,
+        text=True,
+        timeout=60,  # 1 minute timeout
+    )
+    output = result.stdout + result.stderr
+    output = output[:5000]  # Limit output size
+
+    return output if output else f"Command completed with exit code {result.returncode}"
+
+
+@tracked_tool
+def search_code(pattern: str, path: str = ".") -> str:
+    """Search for a pattern in code files using grep.
+
+    Args:
+        pattern: Regex pattern to search for
+        path: Path relative to workspace (default: root)
+
+    Returns:
+        Matching lines or message if no matches
+    """
+    full_path = os.path.join(DEFAULT_CWD, path)
+
+    result = subprocess.run(
+        ["grep", "-r", "-n", "--include=*.py", "--include=*.js", "--include=*.ts",
+         "--include=*.json", "--include=*.yaml", "--include=*.yml", "--include=*.md",
+         pattern, full_path],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = result.stdout[:5000]  # Limit output
+
+    if output:
+        return output
+    else:
+        return f"No matches found for pattern: {pattern}"
+
+
+# ============================================================================
+# Agent Configuration
+# ============================================================================
+
+
+def create_agent() -> Agent:
+    """Create the planner agent with all tools."""
+    return Agent(
+        name="Planner",
+        instructions="""You are a software planning assistant with tools to explore codebases and create implementation plans.
+
+Available tools:
+- create_task: Create planning tasks with dependencies (use blocked_by to define task order)
+- list_tasks: Show all created tasks
+- get_tasks_json: Get tasks as JSON (call this after creating all tasks)
+- read_file: Read file contents
+- write_file: Write/create files
+- list_directory: Explore project structure
+- run_shell_command: Execute shell commands
+- search_code: Search codebase for patterns
+
+Guidelines:
+1. Start by exploring the codebase with list_directory and read_file to understand the structure
+2. Use search_code to find relevant patterns and implementations
+3. Break down the request into 3-8 specific implementation tasks
+4. For EACH task, call create_task with:
+   - subject: Brief title
+   - description: Detailed implementation steps
+   - blocked_by: List of task IDs that must complete first
+5. After creating ALL tasks, call get_tasks_json to return the complete plan
+6. Provide a brief summary of the plan you created
+
+Task Dependencies:
+- Use blocked_by to define execution order
+- blocked_by=['1'] means task 1 must complete before this task
+- Leave blocked_by empty for tasks that can start immediately
+- Build a proper DAG of dependencies for complex plans""",
+        model=get_config("OPENAI_MODEL", "gpt-4o"),
+        tools=[
+            create_task,
+            list_tasks,
+            get_tasks_json,
+            read_file,
+            write_file,
+            list_directory,
+            run_shell_command,
+            search_code,
+        ],
+    )
+
+
+# ============================================================================
+# Workflow Index Operations (for ai-chatbot)
+# ============================================================================
 
 
 def register_workflow_in_index(
@@ -54,15 +652,44 @@ def register_workflow_in_index(
     workflow_name: str,
     message: str,
 ) -> bool:
-    """Register a workflow in the workflow-patterns index for ai-chatbot listing."""
+    """Register a workflow in the workflow-patterns index for ai-chatbot listing.
+
+    Uses the ai-chatbot WorkflowEntry format for compatibility with the UI.
+    """
     now = datetime.now(timezone.utc).isoformat()
 
+    # Use ai-chatbot compatible WorkflowEntry format
     entry = {
+        # Core identifiers (ai-chatbot uses both 'id' and 'instanceId')
+        "id": workflow_id,
         "instanceId": workflow_id,
         "workflowName": workflow_name,
-        "workflowType": "orchestrator",  # Use orchestrator type for agent workflows
-        "status": "running",
+        "workflowType": "orchestrator",
+        "appId": AGENT_ID,
+        "status": "RUNNING",  # Uppercase for ai-chatbot compatibility
+
+        # Request info (ai-chatbot format)
+        "request": {
+            "prompt": message,
+            "submittedAt": now,
+        },
+
+        # Legacy format for backwards compatibility
         "input": {"message": message},
+
+        # Execution state (ai-chatbot format)
+        "execution": {
+            "currentTaskIndex": 0,
+            "completedTasks": [],
+            "failedTasks": [],
+            "skippedTasks": [],
+            "logs": [],
+        },
+
+        # Activities for our agent's detailed tracking
+        "activities": [],
+
+        # Timestamps
         "createdAt": now,
         "updatedAt": now,
     }
@@ -93,7 +720,6 @@ def register_workflow_in_index(
             # Add to front of index if not already present
             if workflow_id not in ids:
                 ids.insert(0, workflow_id)
-                # Keep index manageable
                 if len(ids) > 1000:
                     ids = ids[:1000]
 
@@ -110,18 +736,20 @@ def register_workflow_in_index(
         return False
 
 
-def update_workflow_index_status(
+def update_workflow_status(
     workflow_id: str,
     status: str,
     output: Optional[dict] = None,
     error: Optional[str] = None,
 ) -> bool:
-    """Update workflow status in the index."""
+    """Update workflow status in the index.
+
+    Transforms data to ai-chatbot WorkflowEntry format for UI compatibility.
+    """
     now = datetime.now(timezone.utc).isoformat()
 
     try:
         with DaprClient() as client:
-            # Get existing entry
             entry_data = client.get_state(
                 store_name=WORKFLOW_INDEX_STORE,
                 key=f"{WORKFLOW_KEY_PREFIX}{workflow_id}",
@@ -133,28 +761,255 @@ def update_workflow_index_status(
                 logger.warning(f"Workflow {workflow_id} not found in index")
                 return False
 
-            # Update entry
-            entry["status"] = status
+            # Map status to uppercase for ai-chatbot compatibility
+            status_map = {
+                "running": "RUNNING",
+                "completed": "COMPLETED",
+                "failed": "FAILED",
+                "terminated": "TERMINATED",
+                "cancelled": "CANCELLED",
+            }
+            entry["status"] = status_map.get(status.lower(), status.upper())
             entry["updatedAt"] = now
+
             if output:
+                # Store raw output for our detailed tracking
                 entry["output"] = output
+
+                # Transform to ai-chatbot plan format if tasks are present
+                tasks = output.get("tasks", [])
+                if tasks:
+                    entry["plan"] = {
+                        "id": workflow_id,
+                        "title": output.get("plan", "")[:100] if output.get("plan") else "Planning Tasks",
+                        "summary": output.get("plan", "")[:500] if output.get("plan") else "",
+                        "tasks": [
+                            {
+                                "id": task.get("id", str(i)),
+                                "title": task.get("subject", task.get("title", f"Task {i+1}")),
+                                "description": task.get("description", ""),
+                                "status": task.get("status", "pending"),
+                                "dependsOn": task.get("blockedBy", []),
+                            }
+                            for i, task in enumerate(tasks)
+                        ],
+                    }
+
+                # Add trace metadata if present
+                if output.get("trace"):
+                    entry["trace"] = output["trace"]
+
+                # Add usage if present
+                if output.get("usage"):
+                    entry["usage"] = output["usage"]
+
             if error:
                 entry["error"] = error
-            if status in ("completed", "failed", "terminated"):
+
+            if status.lower() in ("completed", "failed", "terminated"):
                 entry["completedAt"] = now
 
-            # Save updated entry
+            # Convert activities to execution.logs format for ai-chatbot
+            activities = entry.get("activities", [])
+            if activities:
+                logs = []
+                for activity in activities:
+                    # Map activity status to execution log event
+                    activity_status = activity.get("status", "")
+                    if activity_status == "running":
+                        event = "started"
+                    elif activity_status == "completed":
+                        event = "completed"
+                    elif activity_status == "failed":
+                        event = "failed"
+                    else:
+                        event = "started"
+
+                    logs.append({
+                        "timestamp": activity.get("startTime", now),
+                        "taskId": activity.get("activityName", "unknown"),
+                        "event": event,
+                        "message": f"{event.capitalize()}: {activity.get('activityName', 'Activity')}",
+                        "details": activity.get("output") or activity.get("input"),
+                    })
+
+                entry["execution"] = {
+                    "currentTaskIndex": len([a for a in activities if a.get("status") == "completed"]),
+                    "completedTasks": [a.get("activityName") for a in activities if a.get("status") == "completed"],
+                    "failedTasks": [a.get("activityName") for a in activities if a.get("status") == "failed"],
+                    "skippedTasks": [],
+                    "logs": logs,
+                }
+
             client.save_state(
                 store_name=WORKFLOW_INDEX_STORE,
                 key=f"{WORKFLOW_KEY_PREFIX}{workflow_id}",
-                value=json.dumps(entry),
+                value=_safe_json_dumps(entry),
             )
 
-        logger.info(f"Updated workflow {workflow_id} status to {status} in index")
+        logger.info(f"Updated workflow {workflow_id} status to {status}")
         return True
     except Exception as e:
-        logger.warning(f"Failed to update workflow index status: {e}")
+        logger.warning(f"Failed to update workflow status: {e}")
         return False
+
+
+class SafeJSONEncoder(json.JSONEncoder):
+    """JSON encoder that handles complex SDK types."""
+
+    def default(self, obj):
+        # Handle Pydantic models
+        if hasattr(obj, 'model_dump'):
+            return obj.model_dump()
+        # Handle dataclasses
+        if hasattr(obj, '__dataclass_fields__'):
+            from dataclasses import asdict
+            return asdict(obj)
+        # Handle objects with __dict__
+        if hasattr(obj, '__dict__'):
+            result = {k: v for k, v in obj.__dict__.items() if not k.startswith('_')}
+            result['__type__'] = type(obj).__name__
+            return result
+        # Fallback
+        return str(obj)
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    """Safely serialize object to JSON string."""
+    try:
+        return json.dumps(obj, cls=SafeJSONEncoder)
+    except Exception as e:
+        logger.warning(f"JSON serialization fallback: {e}")
+        # Fallback: convert any remaining non-serializable objects to strings
+        def sanitize(o, depth=0):
+            if depth > 5:
+                return str(o)
+            if o is None or isinstance(o, (bool, int, float, str)):
+                return o
+            if isinstance(o, (list, tuple)):
+                return [sanitize(x, depth + 1) for x in o[:100]]
+            if isinstance(o, dict):
+                return {str(k): sanitize(v, depth + 1) for k, v in list(o.items())[:50]}
+            return str(o)
+        return json.dumps(sanitize(obj))
+
+
+def update_workflow_activities(workflow_id: str, activities: List[dict]) -> bool:
+    """Update activities array for workflow visualization.
+
+    Also updates execution.logs for ai-chatbot compatibility.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with DaprClient() as client:
+            entry_data = client.get_state(
+                store_name=WORKFLOW_INDEX_STORE,
+                key=f"{WORKFLOW_KEY_PREFIX}{workflow_id}",
+            )
+
+            if entry_data.data:
+                entry = json.loads(entry_data.data.decode('utf-8'))
+            else:
+                return False
+
+            # Store raw activities for detailed tracking
+            entry["activities"] = activities
+            entry["updatedAt"] = now
+
+            # Convert to ai-chatbot execution.logs format
+            logs = []
+            for activity in activities:
+                activity_status = activity.get("status", "")
+                if activity_status == "running":
+                    event = "started"
+                elif activity_status == "completed":
+                    event = "completed"
+                elif activity_status == "failed":
+                    event = "failed"
+                else:
+                    event = "started"
+
+                logs.append({
+                    "timestamp": activity.get("startTime", now),
+                    "taskId": activity.get("activityName", "unknown"),
+                    "event": event,
+                    "message": f"{event.capitalize()}: {activity.get('activityName', 'Activity')}",
+                    "details": {
+                        "input": activity.get("input"),
+                        "output": activity.get("output"),
+                        "durationMs": activity.get("durationMs"),
+                        "span_id": activity.get("span_id"),
+                    },
+                })
+
+            entry["execution"] = {
+                "currentTaskIndex": len([a for a in activities if a.get("status") == "completed"]),
+                "completedTasks": [a.get("activityName") for a in activities if a.get("status") == "completed"],
+                "failedTasks": [a.get("activityName") for a in activities if a.get("status") == "failed"],
+                "skippedTasks": [],
+                "logs": logs,
+            }
+
+            client.save_state(
+                store_name=WORKFLOW_INDEX_STORE,
+                key=f"{WORKFLOW_KEY_PREFIX}{workflow_id}",
+                value=_safe_json_dumps(entry),
+            )
+
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to update workflow activities: {e}")
+        return False
+
+
+def get_workflow_from_index(workflow_id: str) -> Optional[dict]:
+    """Get workflow entry from index."""
+    try:
+        with DaprClient() as client:
+            entry_data = client.get_state(
+                store_name=WORKFLOW_INDEX_STORE,
+                key=f"{WORKFLOW_KEY_PREFIX}{workflow_id}",
+            )
+            if entry_data.data:
+                return json.loads(entry_data.data.decode('utf-8'))
+    except Exception as e:
+        logger.warning(f"Failed to get workflow from index: {e}")
+    return None
+
+
+def get_workflows_from_index(limit: int = 20) -> List[dict]:
+    """Get list of workflows from index."""
+    try:
+        with DaprClient() as client:
+            index_data = client.get_state(
+                store_name=WORKFLOW_INDEX_STORE,
+                key=WORKFLOW_INDEX_KEY,
+            )
+
+            if not index_data.data:
+                return []
+
+            ids = json.loads(index_data.data.decode('utf-8'))[:limit]
+            workflows = []
+
+            for wf_id in ids:
+                entry_data = client.get_state(
+                    store_name=WORKFLOW_INDEX_STORE,
+                    key=f"{WORKFLOW_KEY_PREFIX}{wf_id}",
+                )
+                if entry_data.data:
+                    workflows.append(json.loads(entry_data.data.decode('utf-8')))
+
+            return workflows
+    except Exception as e:
+        logger.warning(f"Failed to get workflows from index: {e}")
+        return []
+
+
+# ============================================================================
+# Pub/Sub Events
+# ============================================================================
 
 
 def publish_workflow_event(
@@ -163,10 +1018,7 @@ def publish_workflow_event(
     data: dict,
     task_id: Optional[str] = None,
 ) -> bool:
-    """Publish a workflow event to the Dapr pub/sub topic for ai-chatbot.
-
-    Event types: initial, task_progress, execution_started, execution_completed, execution_failed
-    """
+    """Publish a workflow event to the Dapr pub/sub topic for ai-chatbot."""
     event = {
         "id": f"dapr-agent-{workflow_id}-{uuid.uuid4().hex[:8]}",
         "type": event_type,
@@ -193,196 +1045,936 @@ def publish_workflow_event(
         return False
 
 
-async def monitor_workflow_completion(
-    workflow_id: str,
-    message: str,
-    poll_interval: float = 2.0,
-    max_polls: int = 300,  # 10 minutes max
-):
-    """Background task to monitor workflow completion and publish events."""
-    for _ in range(max_polls):
-        await asyncio.sleep(poll_interval)
+# ============================================================================
+# Workflow Execution
+# ============================================================================
+
+
+async def execute_workflow(workflow_id: str, task: str) -> dict:
+    """Execute the planning workflow using OpenAI Agents SDK.
+
+    This follows PR #827's pattern of setting up context before execution
+    and cleaning up after completion.
+    """
+    # Initialize context for this workflow (like PR #827's context setup)
+    reset_workflow_context(workflow_id)
+    ctx = get_workflow_context()
+
+    # Track initial activity
+    track_activity("agent:planning", "running", {"task": task[:200]})
+
+    try:
+        # Create agent
+        agent = create_agent()
+
+        # Get OpenAI API key
+        api_key = get_secret_value("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not configured")
+
+        # Set environment variable for OpenAI client
+        os.environ["OPENAI_API_KEY"] = api_key
+
+        # Run agent
+        # Note: RunHooks disabled due to async compatibility issue with current SDK version
+        # Tool tracking is handled by @tracked_tool interceptor decorator
+        logger.info(f"Starting Runner.run for workflow {workflow_id}")
+        result = await Runner.run(
+            starting_agent=agent,
+            input=task,
+        )
+        logger.info(f"Runner.run completed for workflow {workflow_id}")
+
+        # Get final output
+        final_output = result.final_output
+
+        # Get tasks from context (not globals)
+        tasks = ctx.tasks if ctx else []
+
+        # Get message count (RunResult might have new_items or raw_responses)
+        message_count = len(result.new_items) if hasattr(result, 'new_items') else 0
+
+        # Track completion with usage data
+        track_activity("agent:planning", "completed", output_data={
+            "messages": message_count,
+            "tasks_created": len(tasks),
+            "usage": ctx.usage if ctx else {},
+        })
+
+        # Get trace metadata for OpenAI-compatible output
+        trace_metadata = ctx.get_trace_metadata() if ctx else {}
+
+        # Update workflow status with usage data
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="completed",
+            output={
+                "plan": final_output,
+                "tasks": tasks,
+                "message_count": message_count,
+                "usage": ctx.usage if ctx else {},
+                "trace": trace_metadata,
+            },
+        )
+
+        # Publish completion event
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_completed",
+            data={
+                "status": "completed",
+                "progress": 100,
+                "metadata": {"tasks": tasks, "plan": final_output},
+                "usage": ctx.usage if ctx else {},
+            },
+        )
+
+        logger.info(f"Workflow {workflow_id} completed with {len(tasks)} tasks")
+
+        return {
+            "status": "completed",
+            "plan": final_output,
+            "tasks": tasks,
+            "usage": ctx.usage if ctx else {},
+            "trace": trace_metadata,
+        }
+
+    except Exception as e:
+        logger.error(f"Workflow {workflow_id} failed: {e}")
+
+        track_activity("agent:planning", "failed", output_data={"error": str(e)})
+
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="failed",
+            error=str(e),
+        )
+
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_failed",
+            data={"error": str(e)},
+        )
+
+        return {
+            "status": "failed",
+            "error": str(e),
+        }
+    finally:
+        # Clean up context (like PR #827's finally block)
+        set_workflow_context(None)
+
+
+async def execute_workflow_durable(workflow_id: str, task: str) -> dict:
+    """Execute the planning workflow using DurableAgentRunner.
+
+    This is an alternative implementation that uses the full interceptor framework
+    from PR #827, providing:
+    - Durable tool call recording (for replay/recovery)
+    - Activity tracking (for ai-chatbot visualization)
+    - Metadata envelope propagation
+
+    The DurableAgentRunner wraps all tools with the interceptor chain automatically,
+    so you don't need to use @tracked_tool on individual tools.
+
+    Args:
+        workflow_id: Unique identifier for this workflow
+        task: The planning task/request
+
+    Returns:
+        Dictionary with status, plan, and tasks
+    """
+    # Get OpenAI API key
+    api_key = get_secret_value("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not configured")
+
+    # Set environment variable for OpenAI client
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    # Track initial activity (outside of interceptor chain)
+    track_activity("agent:planning", "running", {"task": task[:200]})
+
+    try:
+        # Create base agent (tools will be wrapped by DurableAgentRunner)
+        # Note: We use non-tracked versions of tools here since the runner wraps them
+        base_agent = Agent(
+            name="Planner",
+            instructions=create_agent().instructions,  # Reuse instructions from create_agent
+            model=get_config("OPENAI_MODEL", "gpt-4o"),
+            tools=[
+                # These are the raw functions, not wrapped with @tracked_tool
+                function_tool(create_task_impl),
+                function_tool(list_tasks_impl),
+                function_tool(get_tasks_json_impl),
+                function_tool(read_file_impl),
+                function_tool(write_file_impl),
+                function_tool(list_directory_impl),
+                function_tool(run_shell_command_impl),
+                function_tool(search_code_impl),
+            ],
+        )
+
+        # Create DurableAgentRunner with interceptor chain
+        # Hooks are optional - they track LLM calls for usage statistics
+        # If hooks cause issues, the runner works without them (tool tracking still works)
         try:
-            with DaprClient() as client:
-                # Query workflow status via Dapr workflow API
-                response = client.get_workflow(
-                    instance_id=workflow_id,
-                    workflow_component="dapr",
-                )
-                # Handle runtime_status - can be enum or string depending on SDK version
-                if hasattr(response.runtime_status, 'name'):
-                    status = response.runtime_status.name
-                else:
-                    status = str(response.runtime_status) if response.runtime_status else "UNKNOWN"
-
-                # Normalize status string
-                status = status.upper().replace("ORCHESTRATION_STATUS_", "")
-
-                if status == "COMPLETED":
-                    # Update index status
-                    update_workflow_index_status(
-                        workflow_id=workflow_id,
-                        status="completed",
-                        output={"message": message, "tasks": _tasks},
-                    )
-                    # Publish event for streaming
-                    publish_workflow_event(
-                        workflow_id=workflow_id,
-                        event_type="execution_completed",
-                        data={
-                            "status": "completed",
-                            "progress": 100,
-                            "metadata": {"message": message, "tasks": _tasks},
-                        },
-                    )
-                    logger.info(f"Workflow {workflow_id} completed")
-                    return
-                elif status in ("FAILED", "TERMINATED"):
-                    # Update index status
-                    update_workflow_index_status(
-                        workflow_id=workflow_id,
-                        status="failed",
-                        error=f"Workflow {status.lower()}",
-                    )
-                    # Publish event for streaming
-                    publish_workflow_event(
-                        workflow_id=workflow_id,
-                        event_type="execution_failed",
-                        data={"error": f"Workflow {status.lower()}"},
-                    )
-                    logger.warning(f"Workflow {workflow_id} {status.lower()}")
-                    return
+            hooks = ActivityTrackingHooks()
+            logger.info("ActivityTrackingHooks created successfully")
         except Exception as e:
-            logger.warning(f"Error polling workflow status: {e}")
-            continue
+            logger.warning(f"Could not create hooks: {e}")
+            hooks = None
 
-    # Timeout - update index and publish failure
-    update_workflow_index_status(
-        workflow_id=workflow_id,
-        status="failed",
-        error="Workflow monitoring timed out",
-    )
-    publish_workflow_event(
-        workflow_id=workflow_id,
-        event_type="execution_failed",
-        data={"error": "Workflow monitoring timed out"},
-    )
-    logger.warning(f"Workflow {workflow_id} monitoring timed out")
+        runner = DurableAgentRunner(
+            agent=base_agent,
+            state_store="statestore",
+            activity_update_callback=update_workflow_activities,
+            run_hooks=hooks,  # May be None if hooks creation failed
+        )
+
+        # Run with durability
+        logger.info(f"Starting DurableAgentRunner for workflow {workflow_id}")
+        durable_result = await runner.run(
+            workflow_id=workflow_id,
+            input=task,
+            metadata={"source": "api", "version": "1.0"},
+        )
+        logger.info(f"DurableAgentRunner completed for workflow {workflow_id}")
+
+        # Extract data from DurableRunResult (context data captured before cleanup)
+        tasks = durable_result.tasks
+        usage = durable_result.usage
+        trace_metadata = durable_result.trace_metadata
+        message_count = len(durable_result.new_items)
+
+        # Track completion with usage data
+        track_activity("agent:planning", "completed", output_data={
+            "messages": message_count,
+            "tasks_created": len(tasks),
+            "usage": usage,
+            "llm_calls": durable_result.llm_call_count,
+        })
+
+        # Update workflow status with usage data
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="completed",
+            output={
+                "plan": durable_result.final_output,
+                "tasks": tasks,
+                "message_count": message_count,
+                "usage": usage,
+                "trace": trace_metadata,
+            },
+        )
+
+        # Publish completion event
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_completed",
+            data={
+                "status": "completed",
+                "progress": 100,
+                "metadata": {"tasks": tasks, "plan": durable_result.final_output},
+                "usage": usage,
+            },
+        )
+
+        logger.info(f"Workflow {workflow_id} completed with {len(tasks)} tasks")
+
+        return {
+            "status": "completed",
+            "plan": durable_result.final_output,
+            "tasks": tasks,
+            "usage": usage,
+            "trace": trace_metadata,
+        }
+
+    except Exception as e:
+        logger.error(f"Workflow {workflow_id} failed: {e}")
+
+        track_activity("agent:planning", "failed", output_data={"error": str(e)})
+
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="failed",
+            error=str(e),
+        )
+
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_failed",
+            data={"error": str(e)},
+        )
+
+        return {
+            "status": "failed",
+            "error": str(e),
+        }
 
 
-# Tool models
-class TaskInput(BaseModel):
-    subject: str = Field(description="Task title")
-    description: str = Field(description="Task details")
-    blocked_by: List[str] = Field(default_factory=list)
+async def execute_workflow_session(workflow_id: str, task: str) -> dict:
+    """Execute the planning workflow using WorkflowContext (clean pattern).
+
+    This execution path provides activity tracking and state persistence
+    using WorkflowContext, following OpenAI Agents SDK patterns:
+
+    1. Agent defined with standard @function_tool and Agent() in agent.py
+    2. WorkflowContext provides activity tracking and state management
+    3. Runner.run() executes the agent normally
+
+    Args:
+        workflow_id: Unique identifier for this workflow
+        task: The planning task/request
+
+    Returns:
+        Dictionary with status, plan, tasks, usage, and trace metadata
+    """
+    # Get OpenAI API key
+    api_key = get_secret_value("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not configured")
+
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    try:
+        # Create the planner agent (clean SDK pattern from agent.py)
+        agent = create_planner_agent(model=get_config("OPENAI_MODEL", "gpt-4o"))
+
+        # Execute with WorkflowContext for durability
+        async with WorkflowContext(
+            workflow_id=workflow_id,
+            state_store="statestore",
+            workflow_name="planner_workflow",
+            metadata={"source": "api", "version": "2.0"},
+            activity_callback=update_workflow_activities,
+        ) as session:
+            # Track agent start
+            session.track_activity(
+                name="agent:planning",
+                status="running",
+                input_data={"task": task[:200], "model": agent.model},
+            )
+
+            logger.info(f"Starting Runner.run for workflow {workflow_id}")
+
+            # Run the agent using standard SDK pattern
+            result = await Runner.run(
+                starting_agent=agent,
+                input=task,
+            )
+
+            logger.info(f"Runner.run completed for workflow {workflow_id}")
+
+            # Track agent completion
+            session.track_activity(
+                name="agent:planning",
+                status="completed",
+                output_data={
+                    "tasks_created": len(session.tasks),
+                    "usage": session.usage,
+                },
+            )
+
+        # Session context has exited - data is captured in session object
+        tasks = session.tasks
+        usage = session.usage
+        trace_metadata = session.trace_metadata
+        message_count = len(result.new_items) if hasattr(result, 'new_items') else 0
+
+        # Update workflow status
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="completed",
+            output={
+                "plan": result.final_output,
+                "tasks": tasks,
+                "message_count": message_count,
+                "usage": usage,
+                "trace": trace_metadata,
+            },
+        )
+
+        # Publish completion event
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_completed",
+            data={
+                "status": "completed",
+                "progress": 100,
+                "metadata": {"tasks": tasks, "plan": result.final_output},
+                "usage": usage,
+            },
+        )
+
+        logger.info(f"Workflow {workflow_id} completed with {len(tasks)} tasks (session mode)")
+
+        return {
+            "status": "completed",
+            "plan": result.final_output,
+            "tasks": tasks,
+            "usage": usage,
+            "trace": trace_metadata,
+        }
+
+    except Exception as e:
+        logger.error(f"Workflow {workflow_id} failed: {e}")
+
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="failed",
+            error=str(e),
+        )
+
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_failed",
+            data={"error": str(e)},
+        )
+
+        return {
+            "status": "failed",
+            "error": str(e),
+        }
 
 
-# Tools
-@tool(args_model=TaskInput)
-def create_task(subject: str, description: str, blocked_by: List[str] = None) -> dict:
-    """Create a planning task."""
-    global _task_counter, _tasks
-    _task_counter += 1
+async def execute_workflow_v2(workflow_id: str, task: str) -> dict:
+    """Execute workflow using official DaprSession with multi-turn support.
+
+    This is the recommended execution path that uses:
+    1. Official DaprSession from agents.extensions.memory for conversation memory
+    2. WorkflowContext for activity tracking and workflow state
+    3. Standard Runner.run() with session parameter
+
+    The official DaprSession stores conversation history (messages) in Dapr state,
+    enabling multi-turn conversations where the agent remembers previous context.
+
+    Args:
+        workflow_id: Unique identifier for this workflow
+        task: The planning task/request
+
+    Returns:
+        Dictionary with status, plan, tasks, usage, and trace metadata
+    """
+    if not OFFICIAL_DAPR_SESSION_AVAILABLE:
+        logger.warning("Official DaprSession not available, falling back to session mode")
+        return await execute_workflow_session(workflow_id, task)
+
+    # Get OpenAI API key
+    api_key = get_secret_value("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not configured")
+
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    try:
+        # Create the planner agent (clean SDK pattern from agent.py)
+        agent = create_planner_agent(model=get_config("OPENAI_MODEL", "gpt-4o"))
+
+        # Create official DaprSession for conversation memory
+        # This stores messages in Dapr state store for multi-turn support
+        session = OfficialDaprSession.from_address(
+            session_id=workflow_id,
+            state_store_name="statestore",
+        )
+
+        # Execute with WorkflowContext for activity tracking
+        async with WorkflowContext(
+            workflow_id=workflow_id,
+            state_store="statestore",
+            workflow_name="planner_workflow",
+            metadata={"source": "api", "version": "2.0", "mode": "v2"},
+            activity_callback=update_workflow_activities,
+        ) as ctx:
+            # Track agent start
+            ctx.track_activity(
+                name="agent:planning",
+                status="running",
+                input_data={"task": task[:200], "model": agent.model, "session_mode": "v2"},
+            )
+
+            logger.info(f"Starting Runner.run for workflow {workflow_id} (v2 mode with official DaprSession)")
+
+            # Run the agent with official DaprSession for conversation memory
+            result = await Runner.run(
+                starting_agent=agent,
+                input=task,
+                session=session,  # Official DaprSession for multi-turn support
+            )
+
+            logger.info(f"Runner.run completed for workflow {workflow_id}")
+
+            # Track agent completion
+            ctx.track_activity(
+                name="agent:planning",
+                status="completed",
+                output_data={
+                    "tasks_created": len(ctx.tasks),
+                    "usage": ctx.usage,
+                },
+            )
+
+        # Context has exited - data is captured in ctx object
+        tasks = ctx.tasks
+        usage = ctx.usage
+        trace_metadata = ctx.trace_metadata
+        message_count = len(result.new_items) if hasattr(result, 'new_items') else 0
+
+        # Update workflow status
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="completed",
+            output={
+                "plan": result.final_output,
+                "tasks": tasks,
+                "message_count": message_count,
+                "usage": usage,
+                "trace": trace_metadata,
+                "mode": "v2",
+            },
+        )
+
+        # Publish completion event
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_completed",
+            data={
+                "status": "completed",
+                "progress": 100,
+                "metadata": {"tasks": tasks, "plan": result.final_output},
+                "usage": usage,
+            },
+        )
+
+        logger.info(f"Workflow {workflow_id} completed with {len(tasks)} tasks (v2 mode)")
+
+        return {
+            "status": "completed",
+            "plan": result.final_output,
+            "tasks": tasks,
+            "usage": usage,
+            "trace": trace_metadata,
+            "mode": "v2",
+        }
+
+    except Exception as e:
+        logger.error(f"Workflow {workflow_id} failed: {e}")
+
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="failed",
+            error=str(e),
+        )
+
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_failed",
+            data={"error": str(e)},
+        )
+
+        return {
+            "status": "failed",
+            "error": str(e),
+        }
+
+
+async def continue_workflow(workflow_id: str, message: str) -> dict:
+    """Continue an existing workflow conversation.
+
+    This uses the official DaprSession to maintain conversation context
+    across multiple turns. The agent will have access to all previous
+    messages and can build on prior work.
+
+    Args:
+        workflow_id: Existing workflow ID to continue
+        message: Follow-up message/question
+
+    Returns:
+        Dictionary with status, response, and updated tasks
+    """
+    if not OFFICIAL_DAPR_SESSION_AVAILABLE:
+        return {
+            "status": "error",
+            "error": "Official DaprSession not available. Install openai-agents[dapr]>=0.7.0",
+        }
+
+    # Get OpenAI API key
+    api_key = get_secret_value("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not configured")
+
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    try:
+        # Create the planner agent
+        agent = create_planner_agent(model=get_config("OPENAI_MODEL", "gpt-4o"))
+
+        # Reuse existing session (conversation history is persisted in DaprSession)
+        session = OfficialDaprSession.from_address(
+            session_id=workflow_id,
+            state_store_name="statestore",
+        )
+
+        # Execute with WorkflowContext for activity tracking
+        async with WorkflowContext(
+            workflow_id=workflow_id,
+            state_store="statestore",
+            workflow_name="planner_workflow",
+            metadata={"source": "api", "version": "2.0", "mode": "continue"},
+            activity_callback=update_workflow_activities,
+        ) as ctx:
+            # Track continuation
+            ctx.track_activity(
+                name="agent:continue",
+                status="running",
+                input_data={"message": message[:200], "model": agent.model},
+            )
+
+            logger.info(f"Continuing workflow {workflow_id} with follow-up message")
+
+            # Run agent with existing session (has previous context)
+            result = await Runner.run(
+                starting_agent=agent,
+                input=message,
+                session=session,  # Session has previous conversation history
+            )
+
+            logger.info(f"Continue completed for workflow {workflow_id}")
+
+            # Track completion
+            ctx.track_activity(
+                name="agent:continue",
+                status="completed",
+                output_data={
+                    "tasks_created": len(ctx.tasks),
+                    "usage": ctx.usage,
+                },
+            )
+
+        # Update workflow with new results
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="completed",
+            output={
+                "response": result.final_output,
+                "tasks": ctx.tasks,
+                "usage": ctx.usage,
+                "trace": ctx.trace_metadata,
+                "mode": "continue",
+            },
+        )
+
+        logger.info(f"Workflow {workflow_id} continuation completed")
+
+        return {
+            "status": "completed",
+            "response": result.final_output,
+            "tasks": ctx.tasks,
+            "usage": ctx.usage,
+            "trace": ctx.trace_metadata,
+        }
+
+    except Exception as e:
+        logger.error(f"Workflow {workflow_id} continuation failed: {e}")
+
+        return {
+            "status": "failed",
+            "error": str(e),
+        }
+
+
+async def execute_workflow_dapr(workflow_id: str, task: str) -> dict:
+    """Execute workflow using DaprOpenAIRunner with true workflow durability.
+
+    This execution path provides true Dapr workflow-level durability:
+    1. Agent execution is wrapped as a Dapr workflow
+    2. Tool execution becomes a durable activity
+    3. Workflows survive crashes and restart from last completed activity
+
+    This is the most durable execution mode, based on patterns from dapr-agents:
+    - DurableAgent: @workflow_entry + ctx.call_activity()
+    - AgentRunner: Workflow lifecycle management
+
+    Args:
+        workflow_id: Unique identifier for this workflow
+        task: The planning task/request
+
+    Returns:
+        Dictionary with status, plan, tasks, usage, and trace metadata
+    """
+    if not DAPR_WORKFLOW_RUNNER_AVAILABLE:
+        logger.warning("DaprOpenAIRunner not available, falling back to v2 mode")
+        return await execute_workflow_v2(workflow_id, task)
+
+    # Get OpenAI API key
+    api_key = get_secret_value("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not configured")
+
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    try:
+        # Create the planner agent (clean SDK pattern from agent.py)
+        agent = create_planner_agent(model=get_config("OPENAI_MODEL", "gpt-4o"))
+
+        # Run with DaprOpenAIRunner for true workflow durability
+        logger.info(f"Starting DaprOpenAIRunner for workflow {workflow_id}")
+
+        result = await run_durable_agent(
+            agent=agent,
+            input=task,
+            workflow_id=workflow_id,
+            activity_callback=update_workflow_activities,
+        )
+
+        logger.info(f"DaprOpenAIRunner completed for workflow {workflow_id}")
+
+        # Extract data from WorkflowResult
+        if result.status in ("COMPLETED", "completed"):
+            # Update workflow status
+            update_workflow_status(
+                workflow_id=workflow_id,
+                status="completed",
+                output={
+                    "plan": result.output.get("output") if result.output else None,
+                    "tasks": result.tasks,
+                    "usage": result.usage,
+                    "trace": result.trace_metadata,
+                    "mode": "workflow",
+                },
+            )
+
+            # Publish completion event
+            publish_workflow_event(
+                workflow_id=workflow_id,
+                event_type="execution_completed",
+                data={
+                    "status": "completed",
+                    "progress": 100,
+                    "metadata": {
+                        "tasks": result.tasks,
+                        "plan": result.output.get("output") if result.output else None,
+                    },
+                    "usage": result.usage,
+                },
+            )
+
+            logger.info(f"Workflow {workflow_id} completed with {len(result.tasks)} tasks (workflow mode)")
+
+            return {
+                "status": "completed",
+                "plan": result.output.get("output") if result.output else None,
+                "tasks": result.tasks,
+                "usage": result.usage,
+                "trace": result.trace_metadata,
+                "mode": "workflow",
+            }
+        else:
+            # Workflow failed or timed out
+            error = result.error or f"Workflow ended with status: {result.status}"
+
+            update_workflow_status(
+                workflow_id=workflow_id,
+                status="failed",
+                error=error,
+            )
+
+            publish_workflow_event(
+                workflow_id=workflow_id,
+                event_type="execution_failed",
+                data={"error": error},
+            )
+
+            return {
+                "status": "failed",
+                "error": error,
+                "mode": "workflow",
+            }
+
+    except Exception as e:
+        logger.error(f"Workflow {workflow_id} failed: {e}")
+
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="failed",
+            error=str(e),
+        )
+
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_failed",
+            data={"error": str(e)},
+        )
+
+        return {
+            "status": "failed",
+            "error": str(e),
+            "mode": "workflow",
+        }
+
+
+# Tool implementation functions (for use with DurableAgentRunner - legacy)
+# These are the raw implementations without @tracked_tool decoration.
+# DurableAgentRunner wraps them automatically with the interceptor chain.
+
+def create_task_impl(subject: str, description: str, blocked_by: Optional[List[str]] = None) -> dict:
+    """Create a planning task with dependencies."""
+    ctx = get_workflow_context()
+    logger.info(f"create_task_impl called with subject={subject}, ctx exists={ctx is not None}, workflow_id={ctx.workflow_id if ctx else 'N/A'}")
+    if not ctx:
+        logger.warning("create_task_impl: No workflow context! Check contextvars propagation.")
+        return {"error": "No workflow context", "id": "0", "subject": subject, "status": "error"}
+
+    ctx.task_counter += 1
+    task_id = str(ctx.task_counter)
+    blocked_by = blocked_by or []
+
     task = {
-        "id": str(_task_counter),
+        "id": task_id,
         "subject": subject,
         "description": description,
         "status": "pending",
-        "blockedBy": blocked_by or [],
+        "blockedBy": blocked_by,
         "blocks": [],
     }
-    _tasks.append(task)
-    for dep_id in (blocked_by or []):
-        for t in _tasks:
+    ctx.tasks.append(task)
+    logger.info(f"create_task_impl: Added task {task_id}, total tasks now: {len(ctx.tasks)}")
+
+    for dep_id in blocked_by:
+        for t in ctx.tasks:
             if t["id"] == dep_id:
-                t["blocks"].append(str(_task_counter))
-    logger.info(f"Created task {_task_counter}: {subject}")
-    return {"id": str(_task_counter), "subject": subject, "status": "pending"}
+                t["blocks"].append(task_id)
+
+    return {"id": task_id, "subject": subject, "status": "pending"}
 
 
-@tool
-def list_tasks() -> str:
-    """List all tasks."""
-    if not _tasks:
-        return "No tasks."
-    return "\n".join(f"[{t['id']}] {t['subject']}" for t in _tasks)
+def list_tasks_impl() -> str:
+    """List all created tasks."""
+    ctx = get_workflow_context()
+    tasks = ctx.tasks if ctx else []
+
+    if not tasks:
+        return "No tasks created yet."
+
+    return "\n".join(f"[{t['id']}] {t['subject']}" for t in tasks)
 
 
-@tool
-def list_directory(path: str = ".") -> dict:
-    """List workspace files."""
-    import glob
+def get_tasks_json_impl() -> dict:
+    """Get all tasks as JSON for the workflow response."""
+    ctx = get_workflow_context()
+    tasks = ctx.tasks if ctx else []
+    return {"tasks": tasks, "count": len(tasks)}
+
+
+def read_file_impl(file_path: str) -> dict:
+    """Read file contents from workspace."""
+    full_path = os.path.join(DEFAULT_CWD, file_path)
+
+    if os.path.exists(full_path):
+        with open(full_path, 'r') as f:
+            content = f.read()[:10000]
+        return {"content": content, "exists": True}
+    else:
+        return {"content": "", "exists": False}
+
+
+def write_file_impl(file_path: str, content: str) -> str:
+    """Write content to a file in the workspace."""
+    full_path = os.path.join(DEFAULT_CWD, file_path)
+    Path(full_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(full_path, 'w') as f:
+        f.write(content)
+
+    return f"Successfully wrote {len(content)} bytes to {file_path}"
+
+
+def list_directory_impl(path: str = ".") -> dict:
+    """List files and directories in workspace."""
     full_path = os.path.join(DEFAULT_CWD, path)
+
     items = glob.glob(os.path.join(full_path, "*"))
     files = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isfile(p)]
     dirs = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isdir(p)]
+
     return {"files": files[:50], "directories": dirs[:20], "count": len(items)}
 
 
-@tool
-def read_file(file_path: str) -> dict:
-    """Read a file."""
-    full_path = os.path.join(DEFAULT_CWD, file_path)
-    if os.path.exists(full_path):
-        with open(full_path, 'r') as f:
-            return {"content": f.read()[:10000], "exists": True}
-    return {"content": "", "exists": False}
-
-
-@tool
-def get_tasks_json() -> dict:
-    """Get all tasks as JSON for the workflow response."""
-    return {"tasks": _tasks, "count": len(_tasks)}
-
-
-def create_agent(session_id: str = None):
-    """Create a fresh DurableAgent instance with ReAct-like execution config."""
-    # Use OpenAIChatClient - documented default for dapr-agents
-    # OPENAI_API_KEY is provided via Azure Key Vault ExternalSecret
-    llm = OpenAIChatClient(
-        model=os.getenv("OPENAI_MODEL", "gpt-4-turbo"),
+def run_shell_command_impl(command: str) -> str:
+    """Execute a shell command in the workspace."""
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=DEFAULT_CWD,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
+    output = result.stdout + result.stderr
+    output = output[:5000]
 
-    agent = DurableAgent(
-        name=f"Planner{uuid.uuid4().hex[:6]}",  # Unique name to avoid memory pollution
-        role="Software Implementation Planner",
-        goal="Create detailed implementation plans by calling the create_task tool for each task",
-        instructions=[
-            "You are a task planning assistant. Your job is to create implementation tasks using the create_task tool.",
-            "IMPORTANT: You MUST use the create_task tool to create tasks. Do NOT just describe tasks in text.",
-            "For each planning request, break it down into 3-8 specific implementation tasks.",
-            "For EACH task, call create_task with: subject (brief title), description (detailed steps), blocked_by (list of task IDs that must complete first).",
-            "Use blocked_by to define task dependencies (e.g., blocked_by=['1'] means task 1 must complete first).",
-            "After creating ALL tasks, call get_tasks_json once to return the complete task list.",
-            "Only after calling get_tasks_json, provide a brief summary of the plan you created.",
-        ],
-        tools=[create_task, list_tasks, get_tasks_json],
-        llm=llm,
-        # Execution config: force tool usage for multi-step execution
-        execution=AgentExecutionConfig(
-            max_iterations=15,  # Allow up to 15 reasoning loops
-            tool_choice="required",  # Force tool usage for multi-step execution
-        ),
-        # State: workflow activity checkpoints (enables replay on failure)
-        state=AgentStateConfig(
-            store=StateStoreService(store_name="statestore")
-        ),
+    return output if output else f"Command completed with exit code {result.returncode}"
+
+
+def search_code_impl(pattern: str, path: str = ".") -> str:
+    """Search for a pattern in code files using grep."""
+    full_path = os.path.join(DEFAULT_CWD, path)
+
+    result = subprocess.run(
+        ["grep", "-r", "-n", "--include=*.py", "--include=*.js", "--include=*.ts",
+         "--include=*.json", "--include=*.yaml", "--include=*.yml", "--include=*.md",
+         pattern, full_path],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
-    return agent
+    output = result.stdout[:5000]
+
+    if output:
+        return output
+    else:
+        return f"No matches found for pattern: {pattern}"
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
 
 
 class RunRequest(BaseModel):
     """Request model for workflow invocation."""
-    message: str = Field(description="The planning request message")
+    # Support both 'task' (new) and 'message' (legacy) fields
+    task: Optional[str] = Field(default=None, description="The planning task/request")
+    message: Optional[str] = Field(default=None, description="Alias for task (legacy)")
+    # Execution mode selection
+    durable: bool = Field(default=False, description="Use DurableAgentRunner with PR #827 interceptors (legacy)")
+    mode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Execution mode: "
+            "'workflow' (Dapr workflow durability - most durable), "
+            "'v2' (official DaprSession - recommended), "
+            "'session' (WorkflowContext), "
+            "'durable' (interceptors), "
+            "'standard' (basic)"
+        )
+    )
 
 
-async def startup_config():
-    """Initialize configuration and secrets from Dapr (or env vars as fallback)."""
+class ContinueRequest(BaseModel):
+    """Request model for continuing a workflow conversation."""
+    message: str = Field(..., description="Follow-up message/question to continue the conversation")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan for startup/shutdown."""
     global PUBSUB_NAME, PUBSUB_TOPIC, WORKFLOW_INDEX_STORE
 
+    # Initialize configuration and secrets from Dapr
     await initialize_config_and_secrets()
 
-    # Update configuration values from Dapr/env vars
+    # Update configuration values
     PUBSUB_NAME = get_config("PUBSUB_NAME", "pubsub")
     PUBSUB_TOPIC = get_config("PUBSUB_TOPIC", "workflow.stream")
     WORKFLOW_INDEX_STORE = get_config("WORKFLOW_INDEX_STORE", "ai-chatbot-statestore")
@@ -392,140 +1984,276 @@ async def startup_config():
     else:
         logger.info("[ConfigProvider] Using environment variables (Dapr not available)")
 
+    # Initialize OpenTelemetry tracing with OpenInference instrumentation (optional)
+    try:
+        from tracing import setup_tracing
+        tracer = setup_tracing(
+            project_name="planner-dapr-agent",
+            enable_openai_instrumentation=True,
+            trace_include_sensitive_data=True,
+        )
+        if tracer:
+            logger.info("[Tracing] OpenTelemetry tracing enabled with OpenInference")
+        else:
+            logger.info("[Tracing] OpenTelemetry not available, using internal tracing only")
+    except ImportError as e:
+        logger.debug(f"[Tracing] Tracing module not available: {e}")
+
+    yield
+
+
+app = FastAPI(
+    title="Planner Agent (OpenAI Agents SDK)",
+    description="Planning agent using OpenAI Agents SDK with Dapr integration",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for Kubernetes."""
+    return {"status": "healthy"}
+
+
+@app.post("/run")
+async def start_workflow(request: RunRequest, background_tasks: BackgroundTasks):
+    """Start a new planning workflow.
+
+    Returns:
+        instance_id: Workflow ID for tracking
+        status: Initial status (started)
+    """
+    # Support both 'task' and 'message' fields for compatibility
+    task = request.task or request.message
+    if not task:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Either 'task' or 'message' field is required"},
+        )
+
+    # Generate workflow ID with wf- prefix for ai-chatbot compatibility
+    workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
+
+    # Register in ai-chatbot index
+    register_workflow_in_index(
+        workflow_id=workflow_id,
+        workflow_name="planner_workflow",
+        message=task,
+    )
+
+    # Publish initial event
+    publish_workflow_event(
+        workflow_id=workflow_id,
+        event_type="initial",
+        data={
+            "status": "started",
+            "metadata": {"task": task},
+        },
+    )
+
+    # Publish execution started event
+    publish_workflow_event(
+        workflow_id=workflow_id,
+        event_type="execution_started",
+        data={
+            "status": "planning",
+            "progress": 10,
+            "metadata": {"phase": "planning"},
+        },
+    )
+
+    # Execute workflow in background
+    # Determine execution mode (mode parameter takes precedence over durable flag)
+    if request.mode:
+        mode = request.mode
+    elif request.durable:
+        mode = "durable"
+    else:
+        mode = "v2"  # Default to v2 mode (official DaprSession - recommended)
+
+    # Dispatch to appropriate execution function
+    if mode == "workflow":
+        background_tasks.add_task(execute_workflow_dapr, workflow_id, task)
+    elif mode == "v2":
+        background_tasks.add_task(execute_workflow_v2, workflow_id, task)
+    elif mode == "durable":
+        background_tasks.add_task(execute_workflow_durable, workflow_id, task)
+    elif mode == "session":
+        background_tasks.add_task(execute_workflow_session, workflow_id, task)
+    else:  # "standard" or any other value
+        background_tasks.add_task(execute_workflow, workflow_id, task)
+
+    return {
+        "instance_id": workflow_id,
+        "status": "started",
+        "mode": mode,
+    }
+
+
+@app.get("/status/{instance_id}")
+async def get_status(instance_id: str):
+    """Get workflow status by instance ID.
+
+    Returns:
+        instance_id: Workflow ID
+        status: Current status
+        output: Workflow output (if completed)
+        created_at: Creation timestamp
+    """
+    entry = get_workflow_from_index(instance_id)
+
+    if not entry:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Workflow {instance_id} not found"},
+        )
+
+    return {
+        "instance_id": instance_id,
+        "status": entry.get("status", "unknown"),
+        "output": entry.get("output"),
+        "created_at": entry.get("createdAt"),
+    }
+
+
+@app.get("/workflows/{workflow_id}")
+async def get_workflow_details(workflow_id: str):
+    """Get detailed workflow information including activities.
+
+    Returns:
+        instanceId: Workflow ID
+        status: Current status
+        activities: Array of activity executions
+        output: Workflow output
+        createdAt: Creation timestamp
+        updatedAt: Last update timestamp
+    """
+    entry = get_workflow_from_index(workflow_id)
+
+    if not entry:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Workflow {workflow_id} not found"},
+        )
+
+    return {
+        "instanceId": workflow_id,
+        "workflowName": entry.get("workflowName"),
+        "status": entry.get("status"),
+        "activities": entry.get("activities", []),
+        "input": entry.get("input"),
+        "output": entry.get("output"),
+        "error": entry.get("error"),
+        "createdAt": entry.get("createdAt"),
+        "updatedAt": entry.get("updatedAt"),
+        "completedAt": entry.get("completedAt"),
+    }
+
+
+@app.get("/workflows")
+async def list_workflows(limit: int = 20):
+    """List all workflows.
+
+    Returns:
+        workflows: Array of workflow entries
+        total: Total count
+    """
+    workflows = get_workflows_from_index(limit)
+    return {
+        "workflows": workflows,
+        "total": len(workflows),
+    }
+
+
+@app.post("/continue/{workflow_id}")
+async def continue_workflow_endpoint(workflow_id: str, request: ContinueRequest):
+    """Continue an existing workflow conversation.
+
+    This endpoint enables multi-turn conversations by continuing an existing
+    workflow with a follow-up message. The agent will have access to all
+    previous context through the official DaprSession.
+
+    Args:
+        workflow_id: ID of the existing workflow to continue
+        request: ContinueRequest with the follow-up message
+
+    Returns:
+        status: Completion status
+        response: Agent's response
+        tasks: Updated task list
+        usage: Token usage for this turn
+    """
+    # Verify workflow exists
+    entry = get_workflow_from_index(workflow_id)
+    if not entry:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Workflow {workflow_id} not found"},
+        )
+
+    # Run continuation (synchronous to return response directly)
+    result = await continue_workflow(workflow_id, request.message)
+
+    if result.get("status") == "error":
+        return JSONResponse(
+            status_code=400,
+            content=result,
+        )
+
+    return result
+
+
+@app.get("/capabilities")
+async def get_capabilities():
+    """Get agent capabilities and available execution modes.
+
+    Returns information about available features, including whether
+    the official DaprSession is available for v2 mode and whether
+    the Dapr workflow extension is available for workflow mode.
+    """
+    return {
+        "official_dapr_session_available": OFFICIAL_DAPR_SESSION_AVAILABLE,
+        "dapr_workflow_runner_available": DAPR_WORKFLOW_RUNNER_AVAILABLE,
+        "execution_modes": {
+            "workflow": {
+                "available": DAPR_WORKFLOW_RUNNER_AVAILABLE,
+                "description": "DaprOpenAIRunner with true Dapr workflow durability (most durable)",
+                "features": ["crash-recovery", "workflow-durability", "activity-checkpointing", "replay"],
+            },
+            "v2": {
+                "available": OFFICIAL_DAPR_SESSION_AVAILABLE,
+                "description": "Official DaprSession for conversation memory (recommended)",
+                "features": ["multi-turn", "conversation-history", "activity-tracking"],
+            },
+            "session": {
+                "available": True,
+                "description": "WorkflowContext for activity tracking",
+                "features": ["activity-tracking", "state-persistence"],
+            },
+            "durable": {
+                "available": True,
+                "description": "DurableAgentRunner with interceptors",
+                "features": ["durability", "replay", "activity-tracking"],
+            },
+            "standard": {
+                "available": True,
+                "description": "Basic execution without durability",
+                "features": ["activity-tracking"],
+            },
+        },
+        "default_mode": "workflow" if DAPR_WORKFLOW_RUNNER_AVAILABLE else ("v2" if OFFICIAL_DAPR_SESSION_AVAILABLE else "session"),
+    }
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+
 
 def main():
+    """Main entry point."""
     port = int(os.getenv("PORT", "8000"))
-
-    # Create FastAPI app with health endpoint FIRST
-    app = FastAPI(
-        title="Planner DurableAgent",
-        description="DurableAgent for software engineering planning with workflow durability",
-    )
-
-    @app.on_event("startup")
-    async def on_startup():
-        """Initialize config provider on startup."""
-        await startup_config()
-
-    @app.get("/health")
-    async def health():
-        """Health check endpoint for Kubernetes."""
-        return {"status": "healthy"}
-
-    # Create the DurableAgent with a fresh session for each startup
-    startup_session = f"planner-startup-{uuid.uuid4().hex[:8]}"
-    agent = create_agent(session_id=startup_session)
-
-    # Create runner - but we'll wrap the endpoint ourselves
-    runner = AgentRunner(timeout_in_seconds=600)
-
-    # Let AgentRunner register its internal workflow machinery on a different path
-    runner.serve(
-        agent,
-        app=app,
-        port=port,
-        expose_entry=True,
-        entry_path="/_internal/run",  # Internal path for AgentRunner
-        status_path="/_internal/run/{instance_id}",
-    )
-
-    @app.post("/run")
-    async def run_with_events(request: RunRequest, background_tasks: BackgroundTasks):
-        """Start a workflow and publish events to ai-chatbot."""
-        global _task_counter, _tasks
-        # Reset task storage for new workflow
-        _task_counter = 0
-        _tasks = []
-
-        # Start workflow via Dapr
-        workflow_id = uuid.uuid4().hex
-        try:
-            with DaprClient() as client:
-                client.start_workflow(
-                    workflow_component="dapr",
-                    workflow_name="agent_workflow",
-                    instance_id=workflow_id,
-                    input={"message": request.message},
-                )
-        except Exception as e:
-            logger.error(f"Failed to start workflow: {e}")
-            return JSONResponse(
-                status_code=500,
-                content={"error": f"Failed to start workflow: {e}"},
-            )
-
-        # Register workflow in index for ai-chatbot listing
-        register_workflow_in_index(
-            workflow_id=workflow_id,
-            workflow_name="agent_workflow",
-            message=request.message,
-        )
-
-        # Publish initial event for real-time streaming
-        publish_workflow_event(
-            workflow_id=workflow_id,
-            event_type="initial",
-            data={
-                "status": "started",
-                "metadata": {"message": request.message},
-            },
-        )
-
-        # Publish execution started event
-        publish_workflow_event(
-            workflow_id=workflow_id,
-            event_type="execution_started",
-            data={
-                "status": "planning",
-                "progress": 10,
-                "metadata": {"phase": "planning"},
-            },
-        )
-
-        # Start background monitoring for completion
-        background_tasks.add_task(
-            monitor_workflow_completion,
-            workflow_id,
-            request.message,
-        )
-
-        return {
-            "instance_id": workflow_id,
-            "status_url": f"/run/{workflow_id}",
-        }
-
-    @app.get("/run/{instance_id}")
-    async def get_workflow_status(instance_id: str):
-        """Get workflow status."""
-        try:
-            with DaprClient() as client:
-                response = client.get_workflow(
-                    instance_id=instance_id,
-                    workflow_component="dapr",
-                )
-                # Handle runtime_status - can be enum or string depending on SDK version
-                if hasattr(response.runtime_status, 'name'):
-                    status = response.runtime_status.name
-                else:
-                    status = str(response.runtime_status) if response.runtime_status else "UNKNOWN"
-                return {
-                    "instance_id": instance_id,
-                    "name": response.workflow_name,
-                    "runtime_status": status,
-                    "created_at": response.created_at.isoformat() if response.created_at else None,
-                    "last_updated_at": response.last_updated_at.isoformat() if response.last_updated_at else None,
-                    "serialized_input": response.serialized_input,
-                    "serialized_output": response.serialized_output,
-                    "serialized_custom_status": response.serialized_custom_status,
-                }
-        except Exception as e:
-            return JSONResponse(
-                status_code=404,
-                content={"error": f"Workflow not found: {e}"},
-            )
-
-    # Run uvicorn ourselves
-    logger.info(f"Starting DurableAgent server on port {port}")
+    logger.info(f"Starting Planner Agent on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 

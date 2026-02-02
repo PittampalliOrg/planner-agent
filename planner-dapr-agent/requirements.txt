@@ -1,21 +1,27 @@
-# Dapr Agents for durable agent orchestration
-dapr-agents[observability]>=0.5.0
+# OpenAI Agents SDK with Dapr integration
+openai-agents[dapr]>=0.7.0
 
-# Dapr SDK for pub/sub event publishing
+# Dapr SDK for state/pub-sub operations
 dapr>=1.14.0
 
-# Anthropic SDK for Claude LLM
-anthropic>=0.40.0
+# Dapr workflow extension for true workflow durability
+dapr-ext-workflow>=1.14.0
 
-# FastAPI HTTP framework
+# FastAPI for HTTP endpoints
 fastapi>=0.100.0
 uvicorn>=0.22.0
 
-# Pydantic for data models
+# Pydantic for data validation
 pydantic>=2.0.0
 
-# Environment variable loading
+# Environment variables support
 python-dotenv>=1.0.0
 
-# HTTP client for Dapr Configuration/Secrets API
-httpx>=0.27.0
+# OpenInference instrumentation for Phoenix/Arize LLM observability
+# Auto-instruments OpenAI SDK calls to capture generation spans
+openinference-instrumentation-openai>=0.1.0
+openinference-semantic-conventions>=0.1.0
+
+# OpenTelemetry for distributed tracing
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp>=1.20.0

@@ -1,0 +1,23 @@
+# LLM Provider Component (Dapr Conversation API) - Local Development
+#
+# For local development, uses local-secrets secretstore (env vars).
+# For K8s deployment, see stacks repo Component-llm-provider.yaml
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: llm-provider
+spec:
+  type: conversation.openai
+  version: v1
+  metadata:
+    # API key from local env-based secret store
+    - name: key
+      secretKeyRef:
+        name: OPENAI_API_KEY
+        key: OPENAI_API_KEY
+    - name: model
+      value: gpt-5.2-codex
+auth:
+  secretStore: local-secrets
+scopes:
+  - planner-dapr-agent

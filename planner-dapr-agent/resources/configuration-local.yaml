@@ -1,0 +1,23 @@
+# Local Configuration Store (File-based)
+#
+# For local development, reads configuration from a JSON file.
+# Mimics the Azure App Config component interface.
+#
+# Create config.json in the app directory with:
+# {
+#   "PUBSUB_NAME": "message-pubsub",
+#   "PUBSUB_TOPIC": "workflow.stream",
+#   "WORKFLOW_INDEX_STORE": "ai-chatbot-statestore"
+# }
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: azureappconfig
+spec:
+  type: configuration.local
+  version: v1
+  metadata:
+    - name: path
+      value: "./config.json"
+scopes:
+  - planner-dapr-agent
