@@ -29,9 +29,11 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
+import threading
+from queue import Queue, Empty
 from dotenv import load_dotenv
 from dapr.clients import DaprClient
 
@@ -114,7 +116,21 @@ WORKFLOW_INDEX_STORE = "ai-chatbot-statestore"
 WORKFLOW_INDEX_KEY = "workflow-patterns-index"
 WORKFLOW_KEY_PREFIX = "workflow-pattern-"
 
-DEFAULT_CWD = os.getenv("PLANNER_CWD", "/app/workspace")
+# Static default for PLANNER_CWD - actual value retrieved via get_workspace_dir()
+_DEFAULT_CWD = "/app/workspace"
+
+
+def get_workspace_dir() -> str:
+    """Get the workspace directory from Dapr config or environment.
+
+    Returns the configured workspace directory, falling back to the default.
+    This function lazily retrieves the value after Dapr config is initialized.
+    """
+    return get_config("PLANNER_CWD", _DEFAULT_CWD)
+
+
+# Backward compatibility alias
+DEFAULT_CWD = _DEFAULT_CWD
 
 
 # ============================================================================
@@ -502,7 +518,8 @@ def read_file(file_path: str) -> dict:
     Returns:
         Dictionary with content and exists flag
     """
-    full_path = os.path.join(DEFAULT_CWD, file_path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, file_path)
 
     if os.path.exists(full_path):
         with open(full_path, 'r') as f:
@@ -523,7 +540,8 @@ def write_file(file_path: str, content: str) -> str:
     Returns:
         Success message or error
     """
-    full_path = os.path.join(DEFAULT_CWD, file_path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, file_path)
 
     # Create parent directories if needed
     Path(full_path).parent.mkdir(parents=True, exist_ok=True)
@@ -544,11 +562,12 @@ def list_directory(path: str = ".") -> dict:
     Returns:
         Dictionary with files, directories, and count
     """
-    full_path = os.path.join(DEFAULT_CWD, path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, path)
 
     items = glob.glob(os.path.join(full_path, "*"))
-    files = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isfile(p)]
-    dirs = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isdir(p)]
+    files = [os.path.relpath(p, workspace) for p in items if os.path.isfile(p)]
+    dirs = [os.path.relpath(p, workspace) for p in items if os.path.isdir(p)]
 
     return {"files": files[:50], "directories": dirs[:20], "count": len(items)}
 
@@ -563,10 +582,11 @@ def run_shell_command(command: str) -> str:
     Returns:
         Command output or error message
     """
+    workspace = get_workspace_dir()
     result = subprocess.run(
         command,
         shell=True,
-        cwd=DEFAULT_CWD,
+        cwd=workspace,
         capture_output=True,
         text=True,
         timeout=60,  # 1 minute timeout
@@ -588,7 +608,8 @@ def search_code(pattern: str, path: str = ".") -> str:
     Returns:
         Matching lines or message if no matches
     """
-    full_path = os.path.join(DEFAULT_CWD, path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, path)
 
     result = subprocess.run(
         ["grep", "-r", "-n", "--include=*.py", "--include=*.js", "--include=*.ts",
@@ -1883,7 +1904,8 @@ def get_tasks_json_impl() -> dict:
 
 def read_file_impl(file_path: str) -> dict:
     """Read file contents from workspace."""
-    full_path = os.path.join(DEFAULT_CWD, file_path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, file_path)
 
     if os.path.exists(full_path):
         with open(full_path, 'r') as f:
@@ -1895,7 +1917,8 @@ def read_file_impl(file_path: str) -> dict:
 
 def write_file_impl(file_path: str, content: str) -> str:
     """Write content to a file in the workspace."""
-    full_path = os.path.join(DEFAULT_CWD, file_path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, file_path)
     Path(full_path).parent.mkdir(parents=True, exist_ok=True)
 
     with open(full_path, 'w') as f:
@@ -1906,21 +1929,23 @@ def write_file_impl(file_path: str, content: str) -> str:
 
 def list_directory_impl(path: str = ".") -> dict:
     """List files and directories in workspace."""
-    full_path = os.path.join(DEFAULT_CWD, path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, path)
 
     items = glob.glob(os.path.join(full_path, "*"))
-    files = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isfile(p)]
-    dirs = [os.path.relpath(p, DEFAULT_CWD) for p in items if os.path.isdir(p)]
+    files = [os.path.relpath(p, workspace) for p in items if os.path.isfile(p)]
+    dirs = [os.path.relpath(p, workspace) for p in items if os.path.isdir(p)]
 
     return {"files": files[:50], "directories": dirs[:20], "count": len(items)}
 
 
 def run_shell_command_impl(command: str) -> str:
     """Execute a shell command in the workspace."""
+    workspace = get_workspace_dir()
     result = subprocess.run(
         command,
         shell=True,
-        cwd=DEFAULT_CWD,
+        cwd=workspace,
         capture_output=True,
         text=True,
         timeout=60,
@@ -1933,7 +1958,8 @@ def run_shell_command_impl(command: str) -> str:
 
 def search_code_impl(pattern: str, path: str = ".") -> str:
     """Search for a pattern in code files using grep."""
-    full_path = os.path.join(DEFAULT_CWD, path)
+    workspace = get_workspace_dir()
+    full_path = os.path.join(workspace, path)
 
     result = subprocess.run(
         ["grep", "-r", "-n", "--include=*.py", "--include=*.js", "--include=*.ts",
@@ -1981,12 +2007,28 @@ class ContinueRequest(BaseModel):
     message: str = Field(..., description="Follow-up message/question to continue the conversation")
 
 
+class TargetRepository(BaseModel):
+    """Target repository for workflow cloning."""
+    owner: str = Field(..., description="Repository owner (user or organization)")
+    repo: str = Field(..., description="Repository name")
+    branch: str = Field(default="main", description="Branch to clone")
+    token: Optional[str] = Field(default=None, description="GitHub access token for private repos")
+
+
 class MultiStepWorkflowRequest(BaseModel):
-    """Request model for multi-step workflow (planning → execution → testing)."""
+    """Request model for multi-step workflow (clone → planning → approval → execution → testing)."""
     task: str = Field(..., description="The task description for the workflow")
     model: str = Field(default="gpt-5.2-codex", description="OpenAI model to use")
     max_turns: int = Field(default=20, description="Max iterations per phase")
     max_test_retries: int = Field(default=3, description="Max retries if tests fail")
+    repository: Optional[TargetRepository] = Field(default=None, description="Repository to clone before planning")
+    auto_approve: bool = Field(default=False, description="Skip approval gate and auto-approve the plan")
+
+
+class ApprovalRequest(BaseModel):
+    """Request model for workflow approval."""
+    approved: bool = Field(..., description="Whether the plan is approved")
+    reason: Optional[str] = Field(default=None, description="Reason for approval/rejection")
 
 
 @asynccontextmanager
@@ -2057,6 +2099,241 @@ app = FastAPI(
 async def health():
     """Health check endpoint for Kubernetes."""
     return {"status": "healthy"}
+
+
+# ============================================================================
+# Dapr Streaming Subscription SSE Endpoint
+# ============================================================================
+
+# Active streaming subscriptions per workflow
+_active_streams: dict[str, Queue] = {}
+_stream_lock = threading.Lock()
+
+
+def _dapr_event_handler(workflow_id: str, queue: Queue):
+    """Create a Dapr pub/sub message handler for a specific workflow."""
+    from dapr.clients.grpc._response import TopicEventResponse
+
+    def handler(message):
+        try:
+            # Parse the message data
+            data = message.data()
+            if isinstance(data, bytes):
+                data = json.loads(data.decode())
+            elif isinstance(data, str):
+                data = json.loads(data)
+
+            # Filter by workflow ID
+            msg_workflow_id = data.get("workflowId", "")
+            if msg_workflow_id == workflow_id:
+                logger.debug(f"[Stream] Event for {workflow_id}: {data.get('type')}")
+                queue.put(data)
+
+            return TopicEventResponse('success')
+        except Exception as e:
+            logger.warning(f"[Stream] Error handling message: {e}")
+            return TopicEventResponse('success')  # Acknowledge anyway to not block
+
+    return handler
+
+
+async def _stream_workflow_events(workflow_id: str, request: Request):
+    """Generator that streams workflow events via SSE using Dapr streaming subscription.
+
+    Architecture:
+    1. On connect: Replay historical events from Dapr workflow state (eliminates Redis)
+    2. Real-time: Stream new events via Dapr streaming subscription
+
+    This removes the need for Redis as an intermediary because:
+    - Dapr workflow state already stores activity history
+    - Streaming subscription provides real-time events directly
+    """
+    from dapr_config import get_config
+
+    pubsub_name = get_config("PUBSUB_NAME", "pubsub")
+    pubsub_topic = get_config("PUBSUB_TOPIC", "workflow.stream")
+
+    # Create a queue for this stream
+    event_queue: Queue = Queue()
+    close_fn = None
+    workflow_completed = False
+
+    with _stream_lock:
+        _active_streams[workflow_id] = event_queue
+
+    try:
+        # ============================================================
+        # Phase 1: Send historical events from Dapr workflow state
+        # This replaces the need for Redis event store
+        # ============================================================
+        initial_event = {
+            "id": f"init-{uuid.uuid4().hex[:8]}",
+            "type": "initial",
+            "workflowId": workflow_id,
+            "data": {"status": "RUNNING", "content": "Connected to workflow stream..."},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        yield f"data: {json.dumps(initial_event)}\n\n"
+
+        # Fetch workflow state which includes activity history
+        try:
+            from dapr.ext.workflow import DaprWorkflowClient
+            wf_client = DaprWorkflowClient()
+            state = wf_client.get_workflow_state(workflow_id)
+
+            if state:
+                runtime_status = state.runtime_status.name if state.runtime_status else "UNKNOWN"
+
+                # Parse custom status for phase/progress info
+                custom_status = {}
+                if state.serialized_custom_status:
+                    try:
+                        custom_status = json.loads(state.serialized_custom_status)
+                    except:
+                        pass
+
+                # Send current status
+                status_event = {
+                    "id": f"status-{uuid.uuid4().hex[:8]}",
+                    "type": "status",
+                    "workflowId": workflow_id,
+                    "data": {
+                        "status": runtime_status,
+                        "phase": custom_status.get("phase", "running"),
+                        "progress": custom_status.get("progress", 0),
+                        "message": custom_status.get("message", ""),
+                    },
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                yield f"data: {json.dumps(status_event)}\n\n"
+
+                # Check if workflow is already completed
+                if runtime_status in ["COMPLETED", "FAILED", "TERMINATED"]:
+                    workflow_completed = True
+
+                    # Send completion event
+                    done_event = {
+                        "id": f"done-{uuid.uuid4().hex[:8]}",
+                        "type": "stream_done",
+                        "workflowId": workflow_id,
+                        "data": {"status": runtime_status},
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    yield f"data: {json.dumps(done_event)}\n\n"
+                    return  # Stream ends for completed workflows
+
+        except Exception as e:
+            logger.debug(f"[Stream] Could not fetch initial workflow state: {e}")
+
+        # ============================================================
+        # Phase 2: Start Dapr streaming subscription for real-time events
+        # ============================================================
+        def start_subscription():
+            nonlocal close_fn
+            try:
+                with DaprClient() as client:
+                    handler = _dapr_event_handler(workflow_id, event_queue)
+                    close_fn = client.subscribe_with_handler(
+                        pubsub_name=pubsub_name,
+                        topic=pubsub_topic,
+                        handler_fn=handler,
+                    )
+                    logger.info(f"[Stream] Started Dapr subscription for {workflow_id}")
+
+                    # Keep subscription alive until queue is removed
+                    while workflow_id in _active_streams:
+                        import time
+                        time.sleep(0.5)
+
+                    if close_fn:
+                        close_fn()
+                        logger.info(f"[Stream] Closed Dapr subscription for {workflow_id}")
+            except Exception as e:
+                logger.error(f"[Stream] Subscription error for {workflow_id}: {e}")
+                event_queue.put({"type": "error", "data": {"error": str(e)}})
+
+        # Start subscription thread
+        sub_thread = threading.Thread(target=start_subscription, daemon=True)
+        sub_thread.start()
+
+        # Stream events from queue
+        timeout_count = 0
+        max_timeout_count = 1800  # 30 minutes at 1 second intervals
+
+        while timeout_count < max_timeout_count:
+            # Check if client disconnected
+            if await request.is_disconnected():
+                logger.info(f"[Stream] Client disconnected for {workflow_id}")
+                break
+
+            try:
+                # Get event from queue with timeout
+                event = event_queue.get(timeout=1.0)
+                timeout_count = 0  # Reset on activity
+
+                # Check for terminal events
+                event_type = event.get("type", "")
+                if event_type in ["execution_completed", "execution_failed", "phase_completed"]:
+                    phase = event.get("data", {}).get("phase", "")
+                    if phase == "completed" or event_type == "execution_completed":
+                        yield f"data: {json.dumps(event)}\n\n"
+                        # Send done marker
+                        done_event = {
+                            "id": f"done-{uuid.uuid4().hex[:8]}",
+                            "type": "stream_done",
+                            "workflowId": workflow_id,
+                            "data": {"status": "COMPLETED"},
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                        yield f"data: {json.dumps(done_event)}\n\n"
+                        break
+
+                yield f"data: {json.dumps(event)}\n\n"
+
+            except Empty:
+                timeout_count += 1
+                # Send heartbeat every 15 seconds
+                if timeout_count % 15 == 0:
+                    heartbeat = {
+                        "id": f"hb-{uuid.uuid4().hex[:8]}",
+                        "type": "heartbeat",
+                        "workflowId": workflow_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    yield f"data: {json.dumps(heartbeat)}\n\n"
+
+    finally:
+        # Cleanup
+        with _stream_lock:
+            if workflow_id in _active_streams:
+                del _active_streams[workflow_id]
+        logger.info(f"[Stream] Ended stream for {workflow_id}")
+
+
+@app.get("/workflows/{workflow_id}/stream")
+async def stream_workflow(workflow_id: str, request: Request):
+    """SSE endpoint for streaming workflow events using Dapr streaming subscriptions.
+
+    This uses Dapr's pull-based streaming subscription (Dapr 1.15+) to receive
+    events directly without the webhook + Redis intermediary.
+
+    Args:
+        workflow_id: The workflow instance ID (e.g., wf-abc123)
+
+    Returns:
+        SSE stream of workflow events
+    """
+    logger.info(f"[Stream] Starting SSE stream for workflow {workflow_id}")
+
+    return StreamingResponse(
+        _stream_workflow_events(workflow_id, request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 @app.post("/run")
@@ -2167,6 +2444,10 @@ async def get_workflow_details(workflow_id: str):
     Returns:
         instanceId: Workflow ID
         status: Current status
+        phase: Current workflow phase (from custom_status)
+        progress: Progress percentage (from custom_status)
+        message: Status message (from custom_status)
+        plan: Plan data if available (from custom_status)
         activities: Array of activity executions
         output: Workflow output
         createdAt: Creation timestamp
@@ -2180,10 +2461,15 @@ async def get_workflow_details(workflow_id: str):
             content={"error": f"Workflow {workflow_id} not found"},
         )
 
-    return {
+    # Build base response from index
+    response = {
         "instanceId": workflow_id,
         "workflowName": entry.get("workflowName"),
         "status": entry.get("status"),
+        "phase": None,
+        "progress": 0,
+        "message": None,
+        "plan": None,
         "activities": entry.get("activities", []),
         "input": entry.get("input"),
         "output": entry.get("output"),
@@ -2192,6 +2478,29 @@ async def get_workflow_details(workflow_id: str):
         "updatedAt": entry.get("updatedAt"),
         "completedAt": entry.get("completedAt"),
     }
+
+    # Try to get custom_status from Dapr workflow runtime for live phase/progress
+    if DAPR_MULTI_STEP_WORKFLOW_AVAILABLE and workflow_id.startswith("wf-"):
+        try:
+            client = DaprWorkflowClient()
+            state = client.get_workflow_state(instance_id=workflow_id)
+            if state and state.serialized_custom_status:
+                custom_status = json.loads(state.serialized_custom_status)
+                # Handle double-encoded JSON
+                if isinstance(custom_status, str):
+                    custom_status = json.loads(custom_status)
+                if isinstance(custom_status, dict):
+                    response["phase"] = custom_status.get("phase")
+                    response["progress"] = custom_status.get("progress", 0)
+                    response["message"] = custom_status.get("message")
+                    response["plan"] = custom_status.get("plan")
+                    # Update status from Dapr state if available
+                    if state.runtime_status:
+                        response["status"] = state.runtime_status.name
+        except Exception as e:
+            logger.debug(f"Could not fetch Dapr workflow state for {workflow_id}: {e}")
+
+    return response
 
 
 @app.get("/workflows")
@@ -2207,6 +2516,80 @@ async def list_workflows(limit: int = 20):
         "workflows": workflows,
         "total": len(workflows),
     }
+
+
+@app.post("/workflow/{workflow_id}/approve")
+async def approve_workflow(workflow_id: str, request: ApprovalRequest):
+    """Approve or reject a workflow plan.
+
+    This endpoint raises the approval event to a Dapr workflow that is
+    waiting at wait_for_external_event("approval").
+
+    Args:
+        workflow_id: The workflow instance ID
+        request: ApprovalRequest with approved boolean and optional reason
+
+    Returns:
+        success: Whether the event was raised
+        workflow_id: The workflow ID
+        message: Status message
+    """
+    if not DAPR_MULTI_STEP_WORKFLOW_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "error": "Dapr multi-step workflow not available",
+                "hint": "Ensure dapr-ext-workflow is installed and Dapr sidecar is running",
+            },
+        )
+
+    try:
+        # Raise the approval event to the waiting workflow
+        client = DaprWorkflowClient()
+        client.raise_workflow_event(
+            instance_id=workflow_id,
+            event_name="approval",
+            data={
+                "approved": request.approved,
+                "reason": request.reason,
+            },
+        )
+
+        logger.info(
+            f"Raised approval event for workflow {workflow_id}: "
+            f"approved={request.approved}, reason={request.reason}"
+        )
+
+        # Update workflow status in index
+        if request.approved:
+            update_workflow_status(
+                workflow_id=workflow_id,
+                status="RUNNING",
+            )
+        else:
+            update_workflow_status(
+                workflow_id=workflow_id,
+                status="REJECTED",
+                error=request.reason or "Plan rejected",
+            )
+
+        return {
+            "success": True,
+            "workflow_id": workflow_id,
+            "message": f"Plan {'approved' if request.approved else 'rejected'}",
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to raise approval event for workflow {workflow_id}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "workflow_id": workflow_id,
+                "error": str(e),
+            },
+        )
 
 
 @app.post("/continue/{workflow_id}")
@@ -2512,24 +2895,25 @@ Completed Tasks: {execution.completed_tasks}"""
 
 
 @app.post("/workflow/dapr")
-async def run_dapr_multi_step(request: MultiStepWorkflowRequest):
+async def run_dapr_multi_step(request: MultiStepWorkflowRequest, background_tasks: BackgroundTasks):
     """Run multi-step workflow using Dapr workflow SDK.
 
-    This endpoint runs the same three-phase agent workflow as /workflow,
-    but uses Dapr's native workflow SDK so activities appear in the
-    ai-chatbot UI workflow graph.
+    This endpoint runs a multi-phase agent workflow using Dapr's native
+    workflow SDK so activities appear in the ai-chatbot UI workflow graph.
 
     Phases:
+    0. Clone (optional) - Clone repository if provided
     1. Planning - Creates detailed plan with tasks and test cases
-    2. Execution - Executes the plan
-    3. Testing - Verifies the implementation
+    2. Approval - Wait for human approval (unless auto_approve=true)
+    3. Execution - Executes the plan
+    4. Testing - Verifies the implementation
 
     Args:
-        request: MultiStepWorkflowRequest with task description and configuration
+        request: MultiStepWorkflowRequest with task, repository, and configuration
 
     Returns:
         workflow_id: Dapr workflow instance ID
-        status: Current status (will be "running" initially)
+        status: Current status ("running" or "pending" if awaiting approval)
     """
     if not DAPR_MULTI_STEP_WORKFLOW_AVAILABLE:
         return JSONResponse(
@@ -2554,6 +2938,28 @@ async def run_dapr_multi_step(request: MultiStepWorkflowRequest):
     # Generate workflow ID
     workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
 
+    # Build workflow input
+    workflow_input = {
+        "task": request.task,
+        "model": request.model,
+        "max_turns": request.max_turns,
+        "max_test_retries": request.max_test_retries,
+        "auto_approve": request.auto_approve,
+    }
+
+    # Add repository config if provided
+    if request.repository:
+        workflow_input["repository"] = {
+            "owner": request.repository.owner,
+            "repo": request.repository.repo,
+            "branch": request.repository.branch,
+            "token": request.repository.token,
+        }
+        logger.info(
+            f"Workflow {workflow_id} will clone {request.repository.owner}/"
+            f"{request.repository.repo}@{request.repository.branch}"
+        )
+
     # Register workflow in index for ai-chatbot visibility
     register_workflow_in_index(
         workflow_id=workflow_id,
@@ -2568,109 +2974,62 @@ async def run_dapr_multi_step(request: MultiStepWorkflowRequest):
         instance_id = client.schedule_new_workflow(
             workflow=multi_step_workflow,
             instance_id=workflow_id,
-            input={
-                "task": request.task,
-                "model": request.model,
-                "max_turns": request.max_turns,
-                "max_test_retries": request.max_test_retries,
-            },
+            input=workflow_input,
         )
 
         logger.info(f"Started Dapr multi-step workflow: {instance_id}")
 
-        # Wait for the workflow to complete
-        state = client.wait_for_workflow_completion(
-            instance_id=instance_id,
-            timeout_in_seconds=600,  # 10 minute timeout
-        )
-
-        # Get the result
-        if state.runtime_status.name == "COMPLETED":
-            result = state.serialized_output
-            logger.info(f"Workflow completed. serialized_output type: {type(result)}")
-            if isinstance(result, str):
-                import json
-                result = json.loads(result)
-
-            # Update the workflow index with completion status and activities
-            logger.info(f"About to update workflow index for {workflow_id}")
-            try:
-                from datetime import datetime, timezone
-                now = datetime.now(timezone.utc).isoformat()
-
-                # Create activities for the three phases
-                activities = [
-                    {
-                        "activityName": "planning",
-                        "status": "completed",
-                        "startTime": now,
-                        "endTime": now,
-                        "input": {"task": request.task},
-                        "output": result.get("plan", {}),
-                    },
-                    {
-                        "activityName": "execution",
-                        "status": "completed",
-                        "startTime": now,
-                        "endTime": now,
-                        "input": {"plan": result.get("plan", {})},
-                        "output": result.get("execution", {}),
-                    },
-                    {
-                        "activityName": "testing",
-                        "status": "completed",
-                        "startTime": now,
-                        "endTime": now,
-                        "input": {"plan": result.get("plan", {}), "execution": result.get("execution", {})},
-                        "output": result.get("testing", {}),
-                    },
-                ]
-
-                # Update activities in index
-                update_workflow_activities(workflow_id, activities)
-
-                # Update status to completed with output
-                update_workflow_status(
-                    workflow_id,
-                    status="completed",
-                    output=result,
-                )
-                logger.info(f"Updated workflow index for {workflow_id}: COMPLETED")
-            except Exception as e:
-                logger.warning(f"Failed to update workflow index: {e}")
-
-            return result
-        elif state.runtime_status.name == "FAILED":
-            error_msg = state.failure_details.message if state.failure_details else "Unknown error"
-
-            # Update the workflow index with failure status
-            try:
-                update_workflow_status(
-                    workflow_id,
-                    status="failed",
-                    error=error_msg,
-                )
-                logger.info(f"Updated workflow index for {workflow_id}: FAILED")
-            except Exception as e:
-                logger.warning(f"Failed to update workflow index: {e}")
-
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "workflow_id": instance_id,
-                    "status": "failed",
-                    "error": error_msg,
-                },
+        # If auto_approve is enabled, wait for completion synchronously
+        # Otherwise return immediately (workflow will pause at approval gate)
+        if request.auto_approve:
+            # Wait for the workflow to complete
+            state = client.wait_for_workflow_completion(
+                instance_id=instance_id,
+                timeout_in_seconds=600,  # 10 minute timeout
             )
+
+            # Get the result
+            if state.runtime_status.name == "COMPLETED":
+                result = state.serialized_output
+                logger.info(f"Workflow completed. serialized_output type: {type(result)}")
+                if isinstance(result, str):
+                    result = json.loads(result)
+
+                # Update the workflow index with completion status
+                _update_workflow_completion(workflow_id, request.task, result)
+                return result
+
+            elif state.runtime_status.name == "FAILED":
+                error_msg = state.failure_details.message if state.failure_details else "Unknown error"
+                update_workflow_status(workflow_id, status="failed", error=error_msg)
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "workflow_id": instance_id,
+                        "status": "failed",
+                        "error": error_msg,
+                    },
+                )
+            else:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "workflow_id": instance_id,
+                        "status": state.runtime_status.name,
+                        "error": f"Workflow ended with status: {state.runtime_status.name}",
+                    },
+                )
         else:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "workflow_id": instance_id,
-                    "status": state.runtime_status.name,
-                    "error": f"Workflow ended with status: {state.runtime_status.name}",
-                },
-            )
+            # Return immediately - workflow will pause at approval gate
+            # Background task monitors and updates status
+            background_tasks.add_task(_monitor_workflow, workflow_id, request.task)
+
+            return {
+                "workflow_id": instance_id,
+                "status": "running",
+                "message": "Workflow started. Will pause at planning phase for approval.",
+                "approval_endpoint": f"/workflow/{instance_id}/approve",
+            }
 
     except Exception as e:
         logger.error(f"Failed to start Dapr workflow: {e}")
@@ -2682,6 +3041,127 @@ async def run_dapr_multi_step(request: MultiStepWorkflowRequest):
                 "error": str(e),
             },
         )
+
+
+def _update_workflow_completion(workflow_id: str, task: str, result: dict) -> None:
+    """Update workflow index with completion status and activities."""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Create activities for the phases
+        activities = []
+
+        # Add clone activity if present
+        if result.get("phase") == "cloning" or "repository" in result:
+            activities.append({
+                "activityName": "clone_repository",
+                "status": "completed",
+                "startTime": now,
+                "endTime": now,
+                "input": {"repository": result.get("repository", {})},
+                "output": {"path": result.get("workspace_path", "")},
+            })
+
+        # Add planning activity
+        activities.append({
+            "activityName": "planning",
+            "status": "completed",
+            "startTime": now,
+            "endTime": now,
+            "input": {"task": task},
+            "output": result.get("plan", {}),
+        })
+
+        # Add execution activity
+        activities.append({
+            "activityName": "execution",
+            "status": "completed",
+            "startTime": now,
+            "endTime": now,
+            "input": {"plan": result.get("plan", {})},
+            "output": result.get("execution", {}),
+        })
+
+        # Add testing activity
+        activities.append({
+            "activityName": "testing",
+            "status": "completed",
+            "startTime": now,
+            "endTime": now,
+            "input": {"plan": result.get("plan", {}), "execution": result.get("execution", {})},
+            "output": result.get("testing", {}),
+        })
+
+        update_workflow_activities(workflow_id, activities)
+        update_workflow_status(workflow_id, status="completed", output=result)
+        logger.info(f"Updated workflow index for {workflow_id}: COMPLETED")
+    except Exception as e:
+        logger.warning(f"Failed to update workflow index: {e}")
+
+
+async def _monitor_workflow(workflow_id: str, task: str) -> None:
+    """Background task to monitor workflow progress and update status."""
+    try:
+        client = DaprWorkflowClient()
+        max_wait_seconds = 86400  # 24 hours (matches approval timeout)
+        poll_interval = 5  # Check every 5 seconds
+
+        import time
+        start_time = time.time()
+
+        while time.time() - start_time < max_wait_seconds:
+            try:
+                state = client.get_workflow_state(instance_id=workflow_id)
+
+                if not state:
+                    logger.warning(f"Workflow {workflow_id} not found")
+                    break
+
+                # Check custom status for phase updates
+                if state.serialized_custom_status:
+                    try:
+                        custom_status = json.loads(state.serialized_custom_status)
+                        # Handle double-encoded JSON (Dapr workflow serializes twice)
+                        if isinstance(custom_status, str):
+                            custom_status = json.loads(custom_status)
+                        phase = custom_status.get("phase", "")
+                        progress = custom_status.get("progress", 0)
+                        message = custom_status.get("message", "")
+
+                        # Update workflow status with phase info
+                        # This allows UI to show progress
+                        logger.debug(f"Workflow {workflow_id} phase: {phase}, progress: {progress}%")
+
+                    except json.JSONDecodeError:
+                        pass
+
+                # Check if workflow is complete
+                if state.runtime_status.name == "COMPLETED":
+                    result = state.serialized_output
+                    if isinstance(result, str):
+                        result = json.loads(result)
+                    _update_workflow_completion(workflow_id, task, result)
+                    logger.info(f"Workflow {workflow_id} completed successfully")
+                    break
+
+                elif state.runtime_status.name == "FAILED":
+                    error_msg = state.failure_details.message if state.failure_details else "Unknown error"
+                    update_workflow_status(workflow_id, status="failed", error=error_msg)
+                    logger.error(f"Workflow {workflow_id} failed: {error_msg}")
+                    break
+
+                elif state.runtime_status.name in ("TERMINATED", "CANCELED"):
+                    update_workflow_status(workflow_id, status=state.runtime_status.name.lower())
+                    logger.info(f"Workflow {workflow_id} {state.runtime_status.name.lower()}")
+                    break
+
+            except Exception as e:
+                logger.warning(f"Error checking workflow {workflow_id} state: {e}")
+
+            await asyncio.sleep(poll_interval)
+
+    except Exception as e:
+        logger.error(f"Workflow monitor for {workflow_id} failed: {e}")
 
 
 @app.get("/capabilities")

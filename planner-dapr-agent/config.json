@@ -1,5 +1,5 @@
 {
-  "PUBSUB_NAME": "message-pubsub",
+  "PUBSUB_NAME": "pubsub",
   "PUBSUB_TOPIC": "workflow.stream",
   "WORKFLOW_INDEX_STORE": "ai-chatbot-statestore"
 }

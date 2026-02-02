@@ -10,4 +10,4 @@ apps:
   appDirPath: ./
   appPort: 8000
   daprHTTPPort: 3500
-  command: [ "chainlit", "run", "app.py", "-w", "--port", "8000" ]
+  command: [ "python", "app.py" ]

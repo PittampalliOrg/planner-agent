@@ -48,6 +48,8 @@ CONFIG_KEYS = [
     "PUBSUB_TOPIC",
     # State store settings
     "WORKFLOW_INDEX_STORE",
+    # Workspace settings
+    "PLANNER_CWD",
     # Feature flags
     "DAPR_WORKFLOW_ENABLED",
     # Observability

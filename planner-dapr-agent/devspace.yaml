@@ -1,10 +1,11 @@
-# DevSpace Configuration for Planner Agent
-# Enables Kubernetes-native development with hot-reload for Python
+# DevSpace Configuration for Planner Dapr Agent
+# Enables Kubernetes-native development with hot-reload for Python/FastAPI
 #
 # Architecture:
-#   - Replaces git-clone init container with file sync
+#   - Targets the planner-dapr-agent deployment in planner-agent namespace
 #   - Syncs local Python files to container in real-time
 #   - Runs uvicorn with --reload for hot module replacement
+#   - Preserves Dapr sidecar for workflow/state/pubsub functionality
 #
 # Usage:
 #   devspace dev                    # Start development mode
@@ -13,30 +14,32 @@
 #   devspace purge                  # Clean up devspace resources
 
 version: v2beta1
-name: planner-agent
+name: planner-dapr-agent
 
 # Import shared variable definitions from templates
 imports:
-  - path: ../../stacks/main/devspace-templates/base.yaml
-  - path: ../../stacks/main/devspace-templates/snippets/fastapi.yaml
+  - path: ../../../stacks/main/devspace-templates/base.yaml
+  - path: ../../../stacks/main/devspace-templates/snippets/fastapi.yaml
 
 # App-specific variable values
 vars:
-  APP_NAME: planner-agent
-  LOCAL_PORT: "8080"
-  CONTAINER_PORT: "8080"
-  SSH_PORT: "2224"
-  UVICORN_APP: "workflow_service:app"
+  APP_NAME: planner-dapr-agent
+  APP_NAMESPACE: planner-agent
+  LOCAL_PORT: "8000"
+  CONTAINER_PORT: "8000"
+  SSH_PORT: "2225"
+  UVICORN_APP: "app:app"
+  UVICORN_PORT: "8000"
   # Override resource defaults for Python apps
   CPU_REQUEST: "200m"
   MEMORY_REQUEST: "512Mi"
-  MEMORY_LIMIT: "4Gi"
+  MEMORY_LIMIT: "2Gi"
 
 # Development configuration
 dev:
-  planner:
-    # Target the deployment
-    namespace: ${APP_NAME}
+  planner-dapr:
+    # Target the deployment (note: different namespace than app name)
+    namespace: ${APP_NAMESPACE}
     labelSelector:
       app: ${APP_NAME}
     container: ${APP_NAME}
@@ -56,16 +59,22 @@ dev:
         memory: ${MEMORY_LIMIT}
 
     # Command to run in the container
+    # Uses uvicorn with --reload for hot module reloading (similar to Next.js dev server)
     command:
       - /bin/sh
       - -c
       - |
-        echo "=== Planner Agent DevSpace Container ==="
-        echo "Replacing production image: ${CURRENT_PRODUCTION_IMAGE}"
-        echo "Using shared devcontainer: python-312-devspace"
+        echo "=== Planner Dapr Agent DevSpace Container ==="
+        echo "App: ${APP_NAME}"
+        echo "Namespace: ${APP_NAMESPACE}"
         echo "Running as user: $(id)"
         which claude && claude --version || echo "Warning: Claude CLI not found"
-        exec uvicorn ${UVICORN_APP} --host ${UVICORN_HOST} --port ${UVICORN_PORT} --reload
+        echo "Waiting for file sync..."
+        while [ ! -f /app/requirements.txt ]; do sleep 1; done
+        echo "Installing Python dependencies..."
+        pip install --quiet --no-cache-dir -r requirements.txt
+        echo "Starting uvicorn with hot reload..."
+        exec uvicorn app:app --host 0.0.0.0 --port ${UVICORN_PORT} --reload --reload-dir /app
 
     # Disable restart helper to avoid permission issues with non-root user
     restartHelper:
@@ -75,8 +84,8 @@ dev:
     sync:
       - path: ./:/app
         initialSync: mirrorLocal
-        startContainer: false
-        waitInitialSync: false
+        startContainer: true
+        waitInitialSync: true
         onUpload:
           restartContainer: false
         excludePaths:
@@ -120,6 +129,9 @@ dev:
           - .devenv.flake.nix
           - .dockerignore
           - .gitignore
+          # Dapr config (use k8s components instead)
+          - dapr.yaml
+          - resources/
 
     # Patches to configure the pod for development
     patches:
@@ -128,9 +140,6 @@ dev:
         path: spec.containers.name=${APP_NAME}.livenessProbe
       - op: remove
         path: spec.containers.name=${APP_NAME}.readinessProbe
-      # Remove init containers (we sync files instead of cloning)
-      - op: remove
-        path: spec.initContainers
       # Run as non-root user (planner) - required for Claude CLI security
       # Note: Use integer literals, not variables (DevSpace passes them as strings)
       - op: replace
@@ -155,7 +164,7 @@ dev:
     env:
       - name: PYTHONUNBUFFERED
         value: "1"
-      - name: WORKSPACE_DIR
+      - name: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - name: PLANNER_CWD
         value: /app/workspace
-      - name: PLANS_DIR
-        value: /app/plans
