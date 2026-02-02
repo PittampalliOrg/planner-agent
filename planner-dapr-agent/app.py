@@ -72,6 +72,21 @@ from dapr_config import initialize_config_and_secrets, get_config, get_secret_va
 # Import agent definition (clean OpenAI SDK pattern)
 from agent import create_planner_agent
 
+# Import multi-step workflow
+from workflow_agent import run_workflow as run_multi_step_workflow, Plan, ExecutionResult, TestResult
+
+# Import Dapr multi-step workflow (proper Dapr workflow with activities)
+try:
+    from dapr_multi_step_workflow import get_workflow_runtime, multi_step_workflow
+    from dapr.ext.workflow import DaprWorkflowClient
+    DAPR_MULTI_STEP_WORKFLOW_AVAILABLE = True
+except ImportError as e:
+    DAPR_MULTI_STEP_WORKFLOW_AVAILABLE = False
+    get_workflow_runtime = None
+    multi_step_workflow = None
+    DaprWorkflowClient = None
+    logger.warning(f"Dapr multi-step workflow not available: {e}")
+
 # Import WorkflowContext for activity tracking (renamed from dapr_session)
 from workflow_context import WorkflowContext, get_session_state
 
@@ -1966,6 +1981,14 @@ class ContinueRequest(BaseModel):
     message: str = Field(..., description="Follow-up message/question to continue the conversation")
 
 
+class MultiStepWorkflowRequest(BaseModel):
+    """Request model for multi-step workflow (planning → execution → testing)."""
+    task: str = Field(..., description="The task description for the workflow")
+    model: str = Field(default="gpt-5.2-codex", description="OpenAI model to use")
+    max_turns: int = Field(default=20, description="Max iterations per phase")
+    max_test_retries: int = Field(default=3, description="Max retries if tests fail")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan for startup/shutdown."""
@@ -1999,7 +2022,28 @@ async def lifespan(app: FastAPI):
     except ImportError as e:
         logger.debug(f"[Tracing] Tracing module not available: {e}")
 
+    # Start Dapr workflow runtime for multi-step workflows
+    # Note: We start this regardless of is_dapr_enabled() because the Dapr sidecar
+    # might not be ready at startup but will be ready when workflows are scheduled
+    workflow_runtime = None
+    if DAPR_MULTI_STEP_WORKFLOW_AVAILABLE:
+        try:
+            workflow_runtime = get_workflow_runtime()
+            workflow_runtime.start()
+            logger.info("[DaprWorkflow] Workflow runtime started for multi_step_workflow")
+        except Exception as e:
+            logger.warning(f"[DaprWorkflow] Failed to start workflow runtime: {e}")
+            workflow_runtime = None
+
     yield
+
+    # Shutdown workflow runtime
+    if workflow_runtime:
+        try:
+            workflow_runtime.shutdown()
+            logger.info("[DaprWorkflow] Workflow runtime stopped")
+        except Exception as e:
+            logger.warning(f"[DaprWorkflow] Error stopping workflow runtime: {e}")
 
 
 app = FastAPI(
@@ -2203,6 +2247,443 @@ async def continue_workflow_endpoint(workflow_id: str, request: ContinueRequest)
     return result
 
 
+@app.post("/workflow")
+async def run_multi_step(request: MultiStepWorkflowRequest, background_tasks: BackgroundTasks):
+    """Run multi-step planning → execution → testing workflow.
+
+    This endpoint runs a three-phase agent workflow:
+    1. Planning Phase - Agent researches and creates a detailed plan with test cases
+    2. Execution Phase - Agent executes the plan using tools
+    3. Testing Phase - Agent verifies the implementation meets requirements
+
+    Each phase terminates when the agent outputs the appropriate structured type:
+    - Planning: outputs Plan (tasks + test cases)
+    - Execution: outputs ExecutionResult (completed tasks)
+    - Testing: outputs TestResult (pass/fail summary)
+
+    Args:
+        request: MultiStepWorkflowRequest with task description and configuration
+
+    Returns:
+        status: "completed" if all tests pass, "failed" otherwise
+        plan: The generated plan with tasks and test cases
+        execution: Results from the execution phase
+        testing: Results from the testing phase
+    """
+    # Get OpenAI API key
+    api_key = get_secret_value("OPENAI_API_KEY")
+    if not api_key:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "OPENAI_API_KEY not configured"},
+        )
+
+    # Set environment variable for OpenAI client
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    # Generate workflow ID
+    workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
+
+    # Register workflow in index for ai-chatbot visibility
+    register_workflow_in_index(
+        workflow_id=workflow_id,
+        workflow_name="multi_step_workflow",
+        message=request.task,
+    )
+    logger.info(f"Registered multi-step workflow {workflow_id} in index")
+
+    # Publish initial event
+    publish_workflow_event(
+        workflow_id=workflow_id,
+        event_type="execution_started",
+        data={"phase": "planning", "task": request.task[:200]},
+    )
+
+    logger.info(f"Starting multi-step workflow {workflow_id} for task: {request.task[:100]}...")
+
+    # Track activities for each phase
+    activities = []
+
+    def add_activity(name: str, status: str, output: dict = None):
+        """Add or update activity in the list."""
+        now = datetime.now(timezone.utc).isoformat()
+        # Find existing activity
+        existing = None
+        for act in activities:
+            if act["activityName"] == name and act["status"] == "running":
+                existing = act
+                break
+
+        if existing and status in ("completed", "failed"):
+            existing["status"] = status
+            existing["endTime"] = now
+            existing["durationMs"] = int((datetime.fromisoformat(now.replace('Z', '+00:00')) -
+                                          datetime.fromisoformat(existing["startTime"].replace('Z', '+00:00'))).total_seconds() * 1000)
+            if output:
+                existing["output"] = output
+        else:
+            activity = {
+                "activityName": name,
+                "status": status,
+                "startTime": now,
+            }
+            if output:
+                activity["output"] = output
+            activities.append(activity)
+
+        # Update workflow activities in index
+        update_workflow_activities(workflow_id, activities)
+
+    try:
+        # Import workflow functions
+        from workflow_agent import (
+            create_planning_agent, create_execution_agent, create_testing_agent,
+            Plan, ExecutionResult, TestResult, Task
+        )
+        from agents import Runner
+
+        # ==================== PHASE 1: PLANNING ====================
+        add_activity("phase:planning", "running")
+        publish_workflow_event(workflow_id, "phase_started", {"phase": "planning"})
+
+        planning_agent = create_planning_agent(request.model)
+        plan_result = await Runner.run(
+            planning_agent,
+            input=request.task,
+            max_turns=request.max_turns,
+        )
+        plan: Plan = plan_result.final_output
+
+        # Auto-populate blocks based on blockedBy
+        task_map = {t.id: t for t in plan.tasks}
+        for task in plan.tasks:
+            for blocked_by_id in task.blockedBy:
+                if blocked_by_id in task_map:
+                    if task.id not in task_map[blocked_by_id].blocks:
+                        task_map[blocked_by_id].blocks.append(task.id)
+
+        add_activity("phase:planning", "completed", {
+            "tasks_created": len(plan.tasks),
+            "tests_created": len(plan.tests),
+            "summary": plan.summary[:200],
+        })
+        publish_workflow_event(workflow_id, "phase_completed", {
+            "phase": "planning",
+            "tasks_created": len(plan.tasks),
+        })
+
+        # ==================== PHASE 2: EXECUTION ====================
+        add_activity("phase:execution", "running")
+        publish_workflow_event(workflow_id, "phase_started", {"phase": "execution"})
+
+        execution_agent = create_execution_agent(request.model)
+        exec_prompt = f"""Execute this plan:
+
+Summary: {plan.summary}
+
+Tasks:
+{chr(10).join(f"- [{t.id}] {t.subject}: {t.description} (blockedBy: {t.blockedBy})" for t in plan.tasks)}
+
+Reasoning: {plan.reasoning}"""
+
+        exec_result = await Runner.run(
+            execution_agent,
+            input=exec_prompt,
+            max_turns=request.max_turns,
+        )
+        execution: ExecutionResult = exec_result.final_output
+
+        add_activity("phase:execution", "completed", {
+            "success": execution.success,
+            "completed_tasks": execution.completed_tasks,
+            "errors": execution.errors,
+        })
+        publish_workflow_event(workflow_id, "phase_completed", {
+            "phase": "execution",
+            "success": execution.success,
+            "completed_tasks": len(execution.completed_tasks),
+        })
+
+        # ==================== PHASE 3: TESTING ====================
+        add_activity("phase:testing", "running")
+        publish_workflow_event(workflow_id, "phase_started", {"phase": "testing"})
+
+        testing_agent = create_testing_agent(request.model)
+        test_prompt = f"""Verify the implementation:
+
+Plan Summary: {plan.summary}
+
+Test Cases:
+{chr(10).join(f"- [{tc.id}] {tc.description} (type: {tc.test_type}, command: {tc.command})" for tc in plan.tests)}
+
+Execution Summary: {execution.output}
+Completed Tasks: {execution.completed_tasks}"""
+
+        test: TestResult = TestResult(
+            passed=False, tests_run=0, tests_passed=0, tests_failed=0,
+            failures=[], summary="Tests not yet run"
+        )
+
+        for attempt in range(request.max_test_retries):
+            test_result = await Runner.run(
+                testing_agent,
+                input=test_prompt,
+                max_turns=request.max_turns,
+            )
+            test = test_result.final_output
+            if test.passed:
+                break
+
+        test_status = "completed" if test.passed else "failed"
+        add_activity("phase:testing", test_status, {
+            "passed": test.passed,
+            "tests_run": test.tests_run,
+            "tests_passed": test.tests_passed,
+            "tests_failed": test.tests_failed,
+            "failures": test.failures,
+        })
+        publish_workflow_event(workflow_id, "phase_completed", {
+            "phase": "testing",
+            "passed": test.passed,
+            "tests_passed": test.tests_passed,
+            "tests_failed": test.tests_failed,
+        })
+
+        # Build result
+        result = {
+            "workflow_id": workflow_id,
+            "plan": plan.model_dump(),
+            "execution": execution.model_dump(),
+            "testing": test.model_dump(),
+            "status": "completed" if test.passed else "failed",
+        }
+
+        # Update workflow status in index
+        final_status = "COMPLETED" if result["status"] == "completed" else "FAILED"
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status=final_status,
+            output=result,
+        )
+
+        # Publish completion event
+        publish_workflow_event(
+            workflow_id=workflow_id,
+            event_type="execution_completed",
+            data={
+                "status": final_status,
+                "tasks_planned": len(plan.tasks),
+                "tasks_executed": len(execution.completed_tasks),
+                "tests_passed": test.tests_passed,
+                "tests_failed": test.tests_failed,
+            },
+        )
+
+        logger.info(f"Multi-step workflow {workflow_id} completed with status: {result['status']}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Multi-step workflow {workflow_id} failed: {e}")
+
+        # Mark current activity as failed
+        for act in activities:
+            if act["status"] == "running":
+                act["status"] = "failed"
+                act["endTime"] = datetime.now(timezone.utc).isoformat()
+                act["output"] = {"error": str(e)}
+        update_workflow_activities(workflow_id, activities)
+
+        # Update workflow status to failed
+        update_workflow_status(
+            workflow_id=workflow_id,
+            status="FAILED",
+            output={"error": str(e)},
+        )
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "workflow_id": workflow_id,
+                "status": "failed",
+                "error": str(e),
+            },
+        )
+
+
+@app.post("/workflow/dapr")
+async def run_dapr_multi_step(request: MultiStepWorkflowRequest):
+    """Run multi-step workflow using Dapr workflow SDK.
+
+    This endpoint runs the same three-phase agent workflow as /workflow,
+    but uses Dapr's native workflow SDK so activities appear in the
+    ai-chatbot UI workflow graph.
+
+    Phases:
+    1. Planning - Creates detailed plan with tasks and test cases
+    2. Execution - Executes the plan
+    3. Testing - Verifies the implementation
+
+    Args:
+        request: MultiStepWorkflowRequest with task description and configuration
+
+    Returns:
+        workflow_id: Dapr workflow instance ID
+        status: Current status (will be "running" initially)
+    """
+    if not DAPR_MULTI_STEP_WORKFLOW_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Dapr multi-step workflow not available",
+                "hint": "Ensure dapr-ext-workflow is installed and Dapr sidecar is running",
+            },
+        )
+
+    # Get OpenAI API key
+    api_key = get_secret_value("OPENAI_API_KEY")
+    if not api_key:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "OPENAI_API_KEY not configured"},
+        )
+
+    # Set environment variable for OpenAI client
+    os.environ["OPENAI_API_KEY"] = api_key
+
+    # Generate workflow ID
+    workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
+
+    # Register workflow in index for ai-chatbot visibility
+    register_workflow_in_index(
+        workflow_id=workflow_id,
+        workflow_name="multi_step_workflow",
+        message=request.task,
+    )
+    logger.info(f"Registered Dapr multi-step workflow {workflow_id} in index")
+
+    try:
+        # Start the Dapr workflow
+        client = DaprWorkflowClient()
+        instance_id = client.schedule_new_workflow(
+            workflow=multi_step_workflow,
+            instance_id=workflow_id,
+            input={
+                "task": request.task,
+                "model": request.model,
+                "max_turns": request.max_turns,
+                "max_test_retries": request.max_test_retries,
+            },
+        )
+
+        logger.info(f"Started Dapr multi-step workflow: {instance_id}")
+
+        # Wait for the workflow to complete
+        state = client.wait_for_workflow_completion(
+            instance_id=instance_id,
+            timeout_in_seconds=600,  # 10 minute timeout
+        )
+
+        # Get the result
+        if state.runtime_status.name == "COMPLETED":
+            result = state.serialized_output
+            logger.info(f"Workflow completed. serialized_output type: {type(result)}")
+            if isinstance(result, str):
+                import json
+                result = json.loads(result)
+
+            # Update the workflow index with completion status and activities
+            logger.info(f"About to update workflow index for {workflow_id}")
+            try:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc).isoformat()
+
+                # Create activities for the three phases
+                activities = [
+                    {
+                        "activityName": "planning",
+                        "status": "completed",
+                        "startTime": now,
+                        "endTime": now,
+                        "input": {"task": request.task},
+                        "output": result.get("plan", {}),
+                    },
+                    {
+                        "activityName": "execution",
+                        "status": "completed",
+                        "startTime": now,
+                        "endTime": now,
+                        "input": {"plan": result.get("plan", {})},
+                        "output": result.get("execution", {}),
+                    },
+                    {
+                        "activityName": "testing",
+                        "status": "completed",
+                        "startTime": now,
+                        "endTime": now,
+                        "input": {"plan": result.get("plan", {}), "execution": result.get("execution", {})},
+                        "output": result.get("testing", {}),
+                    },
+                ]
+
+                # Update activities in index
+                update_workflow_activities(workflow_id, activities)
+
+                # Update status to completed with output
+                update_workflow_status(
+                    workflow_id,
+                    status="completed",
+                    output=result,
+                )
+                logger.info(f"Updated workflow index for {workflow_id}: COMPLETED")
+            except Exception as e:
+                logger.warning(f"Failed to update workflow index: {e}")
+
+            return result
+        elif state.runtime_status.name == "FAILED":
+            error_msg = state.failure_details.message if state.failure_details else "Unknown error"
+
+            # Update the workflow index with failure status
+            try:
+                update_workflow_status(
+                    workflow_id,
+                    status="failed",
+                    error=error_msg,
+                )
+                logger.info(f"Updated workflow index for {workflow_id}: FAILED")
+            except Exception as e:
+                logger.warning(f"Failed to update workflow index: {e}")
+
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "workflow_id": instance_id,
+                    "status": "failed",
+                    "error": error_msg,
+                },
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "workflow_id": instance_id,
+                    "status": state.runtime_status.name,
+                    "error": f"Workflow ended with status: {state.runtime_status.name}",
+                },
+            )
+
+    except Exception as e:
+        logger.error(f"Failed to start Dapr workflow: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "workflow_id": workflow_id,
+                "status": "failed",
+                "error": str(e),
+            },
+        )
+
+
 @app.get("/capabilities")
 async def get_capabilities():
     """Get agent capabilities and available execution modes.
@@ -2214,7 +2695,20 @@ async def get_capabilities():
     return {
         "official_dapr_session_available": OFFICIAL_DAPR_SESSION_AVAILABLE,
         "dapr_workflow_runner_available": DAPR_WORKFLOW_RUNNER_AVAILABLE,
+        "dapr_multi_step_workflow_available": DAPR_MULTI_STEP_WORKFLOW_AVAILABLE,
         "execution_modes": {
+            "multi_step_dapr": {
+                "available": DAPR_MULTI_STEP_WORKFLOW_AVAILABLE,
+                "endpoint": "/workflow/dapr",
+                "description": "Three-phase workflow (planning→execution→testing) using Dapr workflow SDK",
+                "features": ["dapr-activities", "ui-graph-visualization", "workflow-durability", "phase-tracking"],
+            },
+            "multi_step": {
+                "available": True,
+                "endpoint": "/workflow",
+                "description": "Three-phase workflow (planning→execution→testing) with state-store tracking",
+                "features": ["planning", "execution", "testing", "activity-tracking"],
+            },
             "workflow": {
                 "available": DAPR_WORKFLOW_RUNNER_AVAILABLE,
                 "description": "DaprOpenAIRunner with true Dapr workflow durability (most durable)",
@@ -2239,6 +2733,12 @@ async def get_capabilities():
                 "available": True,
                 "description": "Basic execution without durability",
                 "features": ["activity-tracking"],
+            },
+            "multi-step": {
+                "available": True,
+                "description": "Three-phase workflow: Planning → Execution → Testing",
+                "features": ["structured-output", "test-verification", "dependency-ordering"],
+                "endpoint": "/workflow",
             },
         },
         "default_mode": "workflow" if DAPR_WORKFLOW_RUNNER_AVAILABLE else ("v2" if OFFICIAL_DAPR_SESSION_AVAILABLE else "session"),
