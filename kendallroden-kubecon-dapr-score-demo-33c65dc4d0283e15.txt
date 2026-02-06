@@ -1,0 +1,390 @@
+Directory structure:
+└── notifications/
+    ├── app.py
+    ├── Dockerfile
+    ├── requirements.txt
+    ├── score.yaml
+    ├── static/
+    │   ├── css/
+    │   │   └── app.css
+    │   └── js/
+    │       └── app.js
+    └── templates/
+        └── index.html
+
+================================================
+FILE: services/notifications/app.py
+================================================
+import logging
+import os
+
+# Enable debug mode only when environment variable is set
+if os.environ.get('PYTHON_DEBUG', '').lower() == 'true':
+    import debugpy
+    service_name = os.environ.get('SERVICE_NAME', 'unknown')
+    debug_port = int(os.environ.get('DEBUG_PORT', '5678'))
+    
+    print(f"🔍 [{service_name}] Enabling debugpy on port {debug_port}")
+    debugpy.listen(("0.0.0.0", debug_port))
+    
+    # Only wait for connection if explicitly requested
+    if os.environ.get('DEBUG_WAIT', '').lower() == 'true':
+        print(f"⏳ [{service_name}] Waiting for debugger attach...")
+        debugpy.wait_for_client()
+        print(f"✅ [{service_name}] Debugger attached!")
+        
+from flask import Flask, jsonify, render_template, request
+from flask_socketio import SocketIO
+
+APP_PORT = os.getenv("APP_PORT", "3001")
+TOPIC_NAME = os.getenv("TOPIC_NAME", "notifications")
+WITH_SCORE = os.getenv("WITH_SCORE", "false")
+INVENTORY_TYPE = os.getenv("INVENTORY_TYPE", "Redis")
+NOTIFICATIONS_TYPE = os.getenv("NOTIFICATIONS_TYPE", "Redis")
+RUNTIME = os.getenv("RUNTIME", "")
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+@socketio.on('connect')
+def socket_connect():
+    print('connected', flush=True)
+
+
+@app.route('/')
+def index():
+    return render_template('index.html', with_score=WITH_SCORE, inventory_type=INVENTORY_TYPE, notifications_type=NOTIFICATIONS_TYPE, runtime=RUNTIME)
+
+
+@app.route('/' + TOPIC_NAME, methods=['POST', 'PUT'])
+def topic_notifications():
+    # Handles notification events from the Dapr pubsub component.
+    logging.info(f"Received notification: {request.json}")
+    event = request.json
+    # Extract the message string from the input field
+    message = event.get('data', '')
+    socketio.emit('message', {'message': message})
+    return '', 200
+
+
+@app.route("/healthz", methods=["GET"])
+def hello():
+    return f"Hello from {__name__}", 200
+
+
+def main():
+    logging.info("Starting Flask app...")
+    socketio.run(app, host='0.0.0.0', port=APP_PORT, allow_unsafe_werkzeug=True)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        format='%(asctime)s.%(msecs)03d %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=logging.INFO)
+    main()
+
+
+
+================================================
+FILE: services/notifications/Dockerfile
+================================================
+FROM mirror.gcr.io/python:3.13-alpine
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 3001
+ENTRYPOINT ["python"]
+CMD ["app.py"]
+
+
+================================================
+FILE: services/notifications/requirements.txt
+================================================
+flask-socketio == 5.3.6
+flask >= 3.0.0
+
+
+================================================
+FILE: services/notifications/score.yaml
+================================================
+apiVersion: score.dev/v1b1
+metadata:
+  name: notifications
+  annotations:
+    dapr.io/enabled: "true"
+    dapr.io/app-id: "notifications"
+    dapr.io/app-port: "3001"
+containers:
+  notifications:
+    image: .
+    variables:
+      APP_PORT: "3001"
+      TOPIC_NAME: "${resources.subscription.topic}"
+service:
+  ports:
+    http:
+      port: 3001
+      targetPort: 3001
+resources:
+  dns:
+    type: dns
+  route:
+    type: route
+    params:
+      host: ${resources.dns.host}
+      path: /
+      port: 3001
+  pubsub:
+    type: dapr-pubsub
+    id: pubsub
+  subscription:
+    type: dapr-subscription
+    params:
+      topic: "notifications"
+      pubsub: "${resources.pubsub.name}"
+
+
+================================================
+FILE: services/notifications/static/css/app.css
+================================================
+/*
+	Knative colors
+	Dark Blue: #0865ad
+	Light Blue: #6695ca
+*/
+
+
+html,
+body {
+	height: 100%;
+	margin: 0;
+	padding: 0;
+	background-color: #fff;
+}
+
+#wrapper {
+	padding: 0;
+	margin: 0;
+	height: 100%;
+	text-align: center;
+	widows: 100%;
+}
+
+#page-header {
+	padding: 0;
+	margin: 10px 0 0 0;
+	clear: both;
+	break-after: always;
+	height: 100px;
+}
+
+#page-header-image {
+	border: 0;
+	margin-left: 25px;
+}
+
+#page-header-image img {
+	width: 100px;
+	height: 100px;
+	float: left;
+}
+
+#connection {
+	float: right;
+	margin: 10px;
+	font-family: Geneva, Verdana, sans-serif;
+	font-size: 1em;
+}
+
+#middle-section {
+	margin: 0;
+	padding: 10px;
+	height: 700px;
+	overflow: auto;
+}
+
+#middle-section div {
+	margin: 5px;
+}
+
+#page-footer {
+	widows: 80%;
+	margin: 30px 0 0 0;
+	font-family: Geneva, Verdana, sans-serif;
+	font-size: 1em;
+}
+
+#notifications {
+	background-color: #20329b;
+	padding: 0;
+	margin: 5px;
+	height: 690px;
+	overflow: auto;
+}
+
+div.item-text {
+	margin-left: 10px;
+	padding-left: 10px;
+}
+
+#notifications b {
+	font-family: Geneva, Verdana, sans-serif;
+	font-size: 1em;
+	color: #20329b;
+	margin: 0;
+}
+
+#notifications i {
+	font-family: Geneva, Verdana, sans-serif;
+	font-size: 0.8em;
+	font-style: normal;
+}
+
+#notifications i.small {
+	font-size: 0.7em;
+	color: #666666;
+}
+
+.error {
+	color: red;
+}
+
+.item {
+	clear:both;
+	padding: 5px;
+	text-align: left;
+	background-color: #fff;
+	overflow: auto;
+}
+
+
+================================================
+FILE: services/notifications/static/js/app.js
+================================================
+window.onload = function () {
+
+    console.log("Protocol: " + location.protocol);
+    var wsURL = location.protocol + "//" + document.location.host
+    
+    var log = document.getElementById("notifications");
+
+    function appendLog(item) {
+        var doScroll = log.scrollTop > log.scrollHeight - log.clientHeight - 1;
+        log.appendChild(item);
+        if (doScroll) {
+            log.scrollTop = log.scrollHeight - log.clientHeight;
+        }
+    }
+
+    if (log) {
+        var hostDiv = document.getElementById("host");
+        hostDiv.innerText = document.location.host;
+
+        var sock = io.connect(wsURL);
+        var connDiv = document.getElementById("connection-status");
+        connDiv.innerText = "closed";
+
+        sock.on('connect', function () {
+            console.log("connected to " + wsURL);
+            connDiv.innerText = "open";
+        });
+
+        sock.on('disconnect', function (e) {
+            console.log("connection closed (" + e.code + ")");
+            connDiv.innerText = "closed";
+        });
+
+        sock.on('message', function (data) {
+            var item = document.createElement("div");
+            item.className = "item";
+            
+            // Parse the JSON string from the message property
+            var orderData;
+            try {
+                orderData = JSON.parse(data.message);
+            } catch (e) {
+                // Fallback if parsing fails
+                orderData = { order_id: "unknown", message: data.message || "Error parsing message" };
+            }
+            
+            // Create formatted message
+            var timestamp = new Date().toLocaleTimeString();
+            var message = "<i>" + timestamp + "</i> | <b>" + 
+                          orderData.order_id + "</b> | <i>" + 
+                          orderData.message + "</i>";
+            
+            item.innerHTML = "<div class='item-text'>" + message + "</div>";
+            appendLog(item);
+        });
+
+    } 
+};
+
+
+
+================================================
+FILE: services/notifications/templates/index.html
+================================================
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Orders notifications viewer</title>
+    <meta charset="UTF-8">
+    <meta name="description" content="catalyst event viewer">
+    <meta name="keywords" content="events, dapr, websocket, golang">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="static/img/favicon.ico" rel="shortcut icon" />
+    <link rel="stylesheet" href="static/css/app.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.4.1/socket.io.js"></script>
+    <script type="text/javascript" src="static/js/app.js"></script>
+</head>
+
+<body>
+
+    <div id="wrapper">
+
+        <!-- Header -->
+        <div id="page-header">
+            <div id="page-header-image">
+                <img src="static/img/dapr.svg" alt="dapr logo" />
+                {% if with_score == "true" %}
+                <img src="static/img/score.svg" alt="score logo" />
+                {% endif %}
+            </div>
+            <div id="connection">connection: <b id="connection-status"></b></div>
+        </div>
+
+
+        <div id="middle-section">
+            <div id="notifications"></div>
+        </div>
+
+        <!-- Footer -->
+        <div id="page-footer">
+            <div>Host: <b id="host"></b></div>
+            {% if runtime != "" %}
+            <div>On: <b>{{ runtime }}</b></div>
+            {% endif %}
+            <div>Inventory Store: <b>{{ inventory_type }}</b></div>
+            <div>Notifications: <b>{{ notifications_type }}</b></div>
+            <br />
+            <a href="https://dapr.io">
+                Dapr
+            </a>
+            {% if with_score == "true" %}
+            |
+            <a href="https://score.dev">
+                Score
+            </a>
+            {% endif %}
+        </div>
+    </div>
+
+</body>
+
+</html>
+
+

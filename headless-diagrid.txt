@@ -1,0 +1,389 @@
+Directory structure:
+└── 02_durable-agent-headless/
+    ├── README.md
+    ├── app.py
+    ├── app_pubsub_client.py
+    ├── dapr-pubsub-client.yaml
+    ├── dapr.yaml
+    └── resources/
+        ├── execution-state.yaml
+        ├── memory-state.yaml
+        ├── message-pubsub.yaml
+        ├── openai.yaml
+        └── registry-state.yaml
+
+================================================
+FILE: 02_durable-agent-headless/README.md
+================================================
+# Durable Agent Headless
+
+This sample demonstrates how to run a durable headless agent that can be triggered over HTTP REST API and PubSub messaging. Unlike the chat example, this agent runs without a UI and is perfect for backend integrations and automated workflows.
+
+## Prerequisites
+
+Make sure you have completed the setup from the [main README](../README.md):
+
+## What This Example Demonstrates
+
+- **Headless Operation**: Agent runs as a service without UI
+- **Dual Triggering**: Support for both REST API and PubSub messaging
+- **Durable Execution**: Workflow state persisted across restarts
+- **Tool Integration**: Flight search with mock external API calls (50% chance of 20-second delay)
+- **State Management**: Conversation memory, execution state, and agent registry
+
+## Trigger Workflows via REST API
+
+### 1. Deploy and Run the Agent
+
+Deploy the headless agent to Catalyst with managed infrastructure:
+
+```bash
+diagrid dev run -f dapr.yaml --approve
+```
+
+This starts:
+- REST endpoint on port 8001
+- PubSub consumer for message-based triggers
+- Durable workflow engine with state persistence
+
+### 2. Trigger a Workflow
+
+From another terminal, trigger a workflow via REST API:
+
+```bash
+curl -i -X POST http://localhost:8001/start-workflow \
+  -H "Content-Type: application/json" \
+  -d '{"task": "I want to find flights to London"}'
+```
+
+The agent will:
+1. Process your flight request
+2. Execute the `search_flights` tool (50% chance of 20-second delay)
+3. Return flight options with pricing
+4. Persist all state in Catalyst's managed key-value store
+
+### 3. Monitor Execution in Catalyst
+
+**Check Workflow Execution:**
+- Navigate to Catalyst dashboard → Workflows
+- View real-time execution progress and detailed logs
+- Inspect individual workflow steps and timing
+
+**Examine State Storage:**
+- Go to Components → Key-Value Store → `statestore` (execution state)
+- See how workflow state is persisted
+- View conversation memory in `memory-state`
+- Check agent registry in `registry-state`
+
+## Option 2: Trigger Workflows via PubSub
+
+### 1. Deploy Agent with PubSub Client
+
+Run the agent with an additional PubSub client that sends multiple messages:
+
+```bash
+diagrid dev run -f dapr-pubsub-client.yaml --approve
+```
+
+This configuration:
+- Runs the headless agent (same as above)
+- Includes a PubSub client (`app_pubsub_client.py`)
+- Automatically sends flight requests to Paris, London, Tokyo, and New York
+- Each request triggers a separate workflow instance
+
+### 2. Observe Parallel Processing
+
+The PubSub client will automatically trigger multiple workflows:
+- Each destination gets processed as a separate workflow
+- Agent handles multiple concurrent requests
+- All executions are tracked independently in Catalyst
+
+### 3. Explore Application Architecture
+
+**View Service Communication:**
+- In Catalyst dashboard → Application Map
+- See the interaction between PubSub client and agent
+- Observe message flow and service dependencies
+
+![Catalyst Application Architecture](../images/catalyst-durable-agent-headless-app-map.png)
+
+**Monitor PubSub Messaging:**
+- Components → Pub/Sub → `message-pubsub`
+- Track message delivery and processing
+- View throughput and error rates
+
+## Next Steps
+
+- Explore the [03_durable-agent-chat](../03_durable-agent-chat/README.md) for interactive UI
+- Check out the [04_agent-orchestration](../04_agent-orchestration/README.md) for multi-agent coordination
+
+
+
+
+================================================
+FILE: 02_durable-agent-headless/app.py
+================================================
+#!/usr/bin/env python3
+
+import asyncio
+import logging
+import time
+import uuid
+import random
+from typing import List
+from pydantic import BaseModel, Field
+from dapr_agents import tool, DurableAgent, OpenAIChatClient
+from dapr_agents.llm.dapr import DaprChatClient
+import os
+
+from dapr_agents.memory import ConversationDaprStateMemory
+from dotenv import load_dotenv
+
+os.environ.setdefault("DAPR_LLM_COMPONENT_DEFAULT", "openai")
+
+# Define tool output model
+class FlightOption(BaseModel):
+    airline: str = Field(description="Airline name")
+    price: float = Field(description="Price in USD")
+
+# Define tool input model
+class DestinationSchema(BaseModel):
+    destination: str = Field(description="Destination city name")
+
+# Define flight search tool
+@tool(args_model=DestinationSchema)
+def search_flights(destination: str) -> List[FlightOption]:
+    """Search for flights to the specified destination."""
+    # Mock flight data (would be an external API call in a real app)
+
+    # Dynamic delay: 50% no delay, 50% 10-second delay
+    if random.random() < 0.5:
+        time.sleep(20)
+
+    return [
+        FlightOption(airline="SkyHighAir", price=450.00),
+        FlightOption(airline="GlobalWings", price=375.50),
+    ]
+
+async def main():
+
+    travel_planner = DurableAgent(
+        name="TravelBuddy-Headless",
+        role="Travel Assistant",
+        goal="Help users plan trips by finding flights and suggesting hotels",
+        instructions=[
+            "Understand user travel intent even if input is incomplete",
+            "Search for flights and hotels based on context",
+            "Adapt recommendations when preferences change",
+            "Remember user preferences for future queries",
+            "Provide clear and concise information"
+        ],
+        tools=[search_flights],
+
+        # Execution state (workflow progress, retries, failure recovery)
+        state_store_name="statestore",
+        state_key="execution-headless",
+
+        # Long-term memory (preferences, past trips, context continuity)
+        memory=ConversationDaprStateMemory(
+            session_id=f"session-headless-{uuid.uuid4().hex[:8]}"
+        ),
+
+        # PubSub input for real-time interaction
+        message_bus_name="message-pubsub",
+
+        # Agent discovery store
+        agents_registry_store_name="registry-state",
+    )
+
+    try:
+        # start REST endpoint
+        travel_planner.as_service(port=8001)
+        await travel_planner.start()
+        print("Travel Planner Agent is running")
+
+    except Exception as e:
+        print(f"Error starting service: {e}")
+
+if __name__ == "__main__":
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
+
+
+
+
+================================================
+FILE: 02_durable-agent-headless/app_pubsub_client.py
+================================================
+#!/usr/bin/env python3
+import json
+import time
+from dapr.clients import DaprClient
+
+def trigger_agent(agent_topic: str, task: str, pubsub_name: str = "message-pubsub"):
+    """Trigger a DurableAgent with a specific task"""
+
+    try:
+        with DaprClient() as client:
+            client.publish_event(
+                pubsub_name=pubsub_name,
+                topic_name=agent_topic,
+                data=json.dumps({"task": task}),
+                data_content_type="application/json",
+                publish_metadata={
+                    "cloudevent.type": "TriggerAction",
+                }
+            )
+        print(f"✅ Successfully triggered agent '{agent_topic}' with task: {task}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to trigger agent: {e}")
+        return False
+
+# Usage
+if __name__ == "__main__":
+    for dest in ["Paris", "London", "Tokyo", "New York"]:
+        trigger_agent("TravelBuddy-Headless", f"Find flights to {dest}")
+
+
+================================================
+FILE: 02_durable-agent-headless/dapr-pubsub-client.yaml
+================================================
+version: 1
+common:
+  resourcesPath: ./resources
+  logLevel: info
+  appLogDestination: console
+  daprdLogDestination: console
+
+apps:
+- appID: durable-agent-headless
+  appDirPath: ./
+  appPort: 8001
+  daprHTTPPort: 3500
+  command: ["python", "app.py"]
+
+
+- appID: pubsub-client
+  appDirPath: ./
+  command: ["python", "app_pubsub_client.py"]
+
+
+================================================
+FILE: 02_durable-agent-headless/dapr.yaml
+================================================
+version: 1
+common:
+  resourcesPath: ./resources
+  logLevel: info
+  appLogDestination: console
+  daprdLogDestination: console
+
+apps:
+- appID: durable-agent-headless
+  appDirPath: ./
+  appPort: 8001
+  daprHTTPPort: 3500
+  command: [ "python", "app.py"]
+
+
+
+================================================
+FILE: 02_durable-agent-headless/resources/execution-state.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: statestore
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: localhost:6379
+  - name: redisPassword
+    value: "foo"
+  - name: actorStateStore
+    value: "true"
+
+
+
+================================================
+FILE: 02_durable-agent-headless/resources/memory-state.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: memory-state
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: localhost:6379
+    - name: redisPassword
+      value: "foo"
+
+
+
+================================================
+FILE: 02_durable-agent-headless/resources/message-pubsub.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: message-pubsub
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: localhost:6379
+    - name: redisPassword
+      value: "foo"
+    - name: consumerID
+      value: "travel-planner-group"
+    - name: enableTLS
+      value: "false"
+
+
+================================================
+FILE: 02_durable-agent-headless/resources/openai.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: openai
+spec:
+  type: conversation.openai
+  version: v1
+  metadata:
+    - name: key
+      value: <open api key>
+    - name: model
+      value: gpt-4.1-2025-04-14
+
+
+
+================================================
+FILE: 02_durable-agent-headless/resources/registry-state.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: registry-state
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: localhost:6379
+  - name: redisPassword
+    value: "foo"
+  - name: enableTLS
+    value: "false"
+
+
+

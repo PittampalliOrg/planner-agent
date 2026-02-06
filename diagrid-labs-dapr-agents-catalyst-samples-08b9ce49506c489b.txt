@@ -1,0 +1,330 @@
+Directory structure:
+└── 03_durable-agent-chat/
+    ├── README.md
+    ├── app.py
+    ├── dapr.yaml
+    └── resources/
+        ├── execution-state.yaml
+        ├── memory-state.yaml
+        ├── message-pubsub.yaml
+        ├── openai.yaml
+        └── registry-state.yaml
+
+================================================
+FILE: 03_durable-agent-chat/README.md
+================================================
+# Durable Agent Chat
+
+This example demonstrates how to build an interactive chat interface for durable agents using Chainlit. Unlike the headless examples, this provides a user-friendly web UI where you can have conversations with your agent and see real-time responses.
+
+## Prerequisites
+
+Make sure you have completed the setup from the [main README](../README.md):
+
+## What This Example Demonstrates
+
+- **Interactive Chat UI**: Web-based chat interface using Chainlit for live conversation with durable agents
+- **Session Management**: Each chat session gets a unique ID for isolated conversations
+- **Persistent Memory**: Agent remembers conversation history across messages using Dapr state store
+- **Tool Integration**: Flight search tool accessible through natural conversation
+- **Durable Execution**: Each chat message creates a workflow with state persistence
+
+### Architecture
+
+```
+User Chat → Chainlit UI → DurableAgent → Tool Calls → Persistent State → Response
+```
+
+The chat interface creates a new agent session for each user, enabling multiple concurrent conversations with isolated state. Each message creates a durable workflow that persists execution state.
+
+## Deploy and Run
+
+Deploy the chat agent to Catalyst:
+
+```bash
+diagrid dev run -f dapr.yaml --approve
+```
+
+Once deployed, access your agent:
+
+- **Chat Interface**: [http://localhost:8000/](http://localhost:8000/) - Interactive Chainlit web interface
+- **Catalyst Dashboard**: [https://catalyst.diagrid.io/](https://catalyst.diagrid.io/) - Monitor workflows and agent execution
+
+## Using the Chat Interface
+
+### Starting a Conversation
+
+Open the Chainlit web interface and start with a simple flight request:
+
+**Example: "Find me flights to London"**
+
+![Chat Interface - London Query](../images/local-chat-london.png)
+
+This shows how the agent processes your request and provides flight options through the interactive chat interface.
+
+### Multi-Destination Queries
+
+Try a more complex request that triggers multiple tool calls:
+
+**Example: "Find me flights to top 5 capitals of the world"**
+
+![Catalyst Workflow Overview](../images/catalyst-workflow-overview.png)
+
+This demonstrates how the agent intelligently breaks down complex requests and executes multiple tool calls for different destinations.
+
+### Complete Workflow Visualization
+Each chat message creates a new workflow execution:
+- Navigate to Catalyst dashboard → Workflows
+- Each conversation message appears as a separate workflow
+- View detailed execution for individual chat interactions
+
+See the full journey from chat interaction to workflow execution:
+
+![Chat and Workflow Side by Side](../images/local-chat-catalyst-side-by-side.png)
+
+This side-by-side view shows both the chat interface with comprehensive flight results and the corresponding workflow execution in Catalyst, demonstrating how each chat message creates detailed workflow traces.
+
+## Next Steps
+
+- Check out the [04_agent-orchestration](../04_agent-orchestration/README.md) for advanced workflow patterns and orchestration
+- Explore the [05_customer-support-system](../05_customer-support-system/README.md) for a complete multi-agent system
+
+
+
+================================================
+FILE: 03_durable-agent-chat/app.py
+================================================
+#!/usr/bin/env python3
+
+import chainlit as cl
+import logging
+import json
+import uuid
+from typing import List
+from pydantic import BaseModel, Field
+from dapr_agents import tool, DurableAgent, OpenAIChatClient
+from dapr_agents.memory import ConversationDaprStateMemory
+from dotenv import load_dotenv
+
+from dapr_agents.llm.dapr import DaprChatClient
+import os
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+os.environ.setdefault("DAPR_LLM_COMPONENT_DEFAULT", "openai")
+
+# Define tool output model
+class FlightOption(BaseModel):
+    airline: str = Field(description="Airline name")
+    price: float = Field(description="Price in USD")
+
+# Define tool input model
+class DestinationSchema(BaseModel):
+    destination: str = Field(description="Destination city name")
+
+# Define flight search tool
+@tool(args_model=DestinationSchema)
+def search_flights(destination: str) -> List[FlightOption]:
+    """Search for flights to the specified destination."""
+    # Mock flight data (would be an external API call in a real app)
+    return [
+        FlightOption(airline="SkyHighAir", price=450.00),
+        FlightOption(airline="GlobalWings", price=375.50),
+    ]
+
+@cl.on_chat_start
+async def start():
+    """Initialize the chat session with a unique session ID."""
+    
+    # Generate a unique session ID for this chat session
+    session_id = f"session-{uuid.uuid4().hex[:8]}"
+    
+    # Create the DurableAgent instance with the session-specific memory
+    travel_planner = DurableAgent(
+        name="TravelAssistant-Chat",
+        role="Travel Assistant",
+        goal="Help users find flights and remember preferences",
+        instructions=[
+            "You are a travel assistant that helps users search for flights.",
+            "Use the search_flights tool to find flights to destinations.",
+            "Provide clear flight information with airline names and prices.",
+        ],
+        tools=[search_flights],
+        llm = DaprChatClient(),
+        message_bus_name="message-pubsub",
+        state_store_name="statestore",
+        state_key="execution-chat",
+
+        agents_registry_store_name="registry-state",
+        memory=ConversationDaprStateMemory(
+            store_name="memory-state", session_id=session_id
+        ),
+    )
+    
+    # Store the agent in the user session
+    cl.user_session.set("travel_planner", travel_planner)
+    
+    await cl.Message(
+        content="✈️ **Flight Search Assistant**\n\n"
+                "Tell me where you'd like to go and I'll find flights for you!\n\n"
+                "Example: 'Find flights to Tokyo'\n\n"
+                f"💡 *Session ID: {session_id}*"
+    ).send()
+
+@cl.on_message
+async def main(message: cl.Message):
+    """Handle user messages and interact with the DurableAgent."""
+    try:
+        # Get the session-specific travel_planner
+        travel_planner = cl.user_session.get("travel_planner")
+        
+        if not travel_planner:
+            await cl.Message(
+                content="❌ Session error. Please refresh the page to start a new session."
+            ).send()
+            return
+            
+        response: str = await travel_planner.run(message.content)
+
+        # Parse the response to extract just the content
+        try:
+            response_data = json.loads(response)
+            if isinstance(response_data, dict) and 'content' in response_data:
+                content = response_data['content']
+            else:
+                content = response
+        except (json.JSONDecodeError, TypeError):
+            # If it's not JSON, use the response as-is
+            content = response
+
+        # Send the agent's response back to ChainLit
+        await cl.Message(content=content).send()
+        
+        logging.info("Message processed successfully")
+
+    except Exception as e:
+        logging.error(f"Error processing message: {e}")
+        await cl.Message(
+            content=f"❌ I apologize, but I encountered an error while processing your request. "
+                    f"Please try again or refresh the page to start a new session.\n\n"
+                    f"Error: {str(e)}"
+        ).send()
+
+
+
+================================================
+FILE: 03_durable-agent-chat/dapr.yaml
+================================================
+version: 1
+common:
+  resourcesPath: ./resources
+  logLevel: info
+  appLogDestination: console
+  daprdLogDestination: console
+
+apps:
+- appID: durable-agent-chat
+  appDirPath: ./
+  appPort: 8000
+  daprHTTPPort: 3500
+  command: [ "chainlit", "run", "app.py", "-w" ]
+
+
+
+================================================
+FILE: 03_durable-agent-chat/resources/execution-state.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: statestore
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: localhost:6379
+  - name: redisPassword
+    value: "foo"
+  - name: actorStateStore
+    value: "true"
+
+
+
+================================================
+FILE: 03_durable-agent-chat/resources/memory-state.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: memory-state
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: localhost:6379
+    - name: redisPassword
+      value: "foo"
+
+
+
+================================================
+FILE: 03_durable-agent-chat/resources/message-pubsub.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: message-pubsub
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: localhost:6379
+    - name: redisPassword
+      value: "foo"
+    - name: consumerID
+      value: "travel-planner-group"
+    - name: enableTLS
+      value: "false"
+
+
+================================================
+FILE: 03_durable-agent-chat/resources/openai.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: openai
+spec:
+  type: conversation.openai
+  version: v1
+  metadata:
+    - name: key
+      value: <open api key>
+    - name: model
+      value: gpt-4.1-2025-04-14
+
+
+
+================================================
+FILE: 03_durable-agent-chat/resources/registry-state.yaml
+================================================
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: registry-state
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: localhost:6379
+  - name: redisPassword
+    value: "foo"
+  - name: enableTLS
+    value: "false"
+
+
