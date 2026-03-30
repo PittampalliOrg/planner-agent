@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +41,7 @@ from streaming import (
     stream_tool_result,
     stream_file_changed,
 )
+from version import __version__
 
 
 # =============================================================================
@@ -300,7 +300,7 @@ class PlannerAgent:
         # Create MCP server with our tools
         self.mcp_server = create_sdk_mcp_server(
             name="planner",
-            version="1.0.0",
+            version=__version__,
             tools=[
                 task_create,
                 task_update,
@@ -863,42 +863,19 @@ Start by exploring the codebase."""
 # Main Entry Point
 # =============================================================================
 
-async def main():
+async def main(
+    cwd: str | None = None,
+    plans_dir: str | None = None,
+    prompt: str | None = None,
+) -> None:
     """Main entry point for the planner agent."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Planner Agent - Claude Code Plan Mode Replica"
-    )
-    parser.add_argument(
-        "--cwd",
-        type=str,
-        default=None,
-        help="Working directory (git repository) to work in",
-    )
-    parser.add_argument(
-        "--plans-dir",
-        type=str,
-        default=None,
-        help="Directory to store plans and tasks",
-    )
-    parser.add_argument(
-        "prompt",
-        nargs="?",
-        type=str,
-        default=None,
-        help="Feature request to plan (if not provided, runs interactively)",
-    )
-
-    args = parser.parse_args()
-
     agent = PlannerAgent(
-        cwd=args.cwd,
-        plans_dir=args.plans_dir,
+        cwd=cwd,
+        plans_dir=plans_dir,
     )
 
-    if args.prompt:
-        await agent.run_planning_session(args.prompt)
+    if prompt:
+        await agent.run_planning_session(prompt)
     else:
         await agent.run_interactive()
 
