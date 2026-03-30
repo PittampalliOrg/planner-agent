@@ -39,6 +39,14 @@ from planner_agent import PlannerAgent
 
 
 # =============================================================================
+# App Metadata
+# =============================================================================
+
+APP_NAME = "Planner Agent"
+APP_VERSION = "1.0.0"
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -127,6 +135,7 @@ async def lifespan(app: FastAPI):
     global _workflow_runtime
 
     # Startup
+    print(f"[{APP_NAME}] v{APP_VERSION} starting up...")
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     PLANS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[Workflow Service] Started. Workspace: {WORKSPACE_DIR}, Plans: {PLANS_DIR}")
@@ -165,7 +174,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Planner Agent Workflow Service",
     description="HTTP endpoints for repository cloning and AI-powered planning",
-    version="1.0.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -417,8 +426,8 @@ async def health():
 async def root():
     """Root endpoint."""
     return {
-        "service": "planner-agent-workflow-service",
-        "version": "1.0.0",
+        "service": APP_NAME,
+        "version": APP_VERSION,
         "endpoints": [
             "/api/clone",
             "/api/plan",
