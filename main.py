@@ -18,9 +18,13 @@ from claude_agent_sdk import CLINotFoundError, ProcessError, CLIJSONDecodeError
 
 from planner_agent import main
 
+APP_NAME = "Planner Agent"
+APP_VERSION = "1.0.0"
+
 
 async def run_with_error_handling() -> None:
     """Run the main function with SDK-specific error handling."""
+    print(f"[{APP_NAME}] v{APP_VERSION} starting up...")
     try:
         await main()
     except CLINotFoundError:
