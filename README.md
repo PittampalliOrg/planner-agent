@@ -64,6 +64,33 @@ Store plans in a custom location:
 python main.py --plans-dir ./my-plans "Implement caching"
 ```
 
+## CLI Options
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--version` | | Print the version and exit |
+| `--verbose` | `-v` | Enable debug-level logging |
+| `--cwd PATH` | | Working directory (git repository) to work in |
+| `--plans-dir PATH` | | Directory to store plans and tasks |
+
+### Print version
+
+```bash
+python main.py --version
+```
+
+### Run with verbose (debug) logging
+
+```bash
+python main.py --verbose "Add feature X"
+```
+
+### Combine flags
+
+```bash
+python main.py -v --cwd /path/to/repo "Add feature X"
+```
+
 ## Workflow
 
 The planner agent follows a structured workflow:
