@@ -10,6 +10,7 @@ A Claude Agent SDK application that replicates Claude Code's **plan mode** funct
 - **Task Management**: Converts approved plans into tracked tasks with dependencies
 - **Sequential Implementation**: Works through tasks in order, respecting dependencies
 - **Persistence**: Plans and tasks are saved to disk for review and continuation
+- **Dynamic Skills**: Extend agent capabilities at runtime without modifying core code
 
 ## Installation
 
@@ -64,6 +65,17 @@ Store plans in a custom location:
 python main.py --plans-dir ./my-plans "Implement caching"
 ```
 
+### Load Skills from a Directory
+
+Pass a directory of skill modules to extend the agent's capabilities:
+
+```bash
+python main.py --skills-dir ./my-skills "Add search feature"
+```
+
+Every `.py` file in the directory that exposes a `get_skill()` function is loaded
+automatically. See the [Skills](#skills) section for how to write a custom skill.
+
 ## Workflow
 
 The planner agent follows a structured workflow:
@@ -100,6 +112,142 @@ The agent works through tasks sequentially:
 3. Marks the task as completed
 4. Moves to the next available task
 
+## Skills
+
+Skills are self-contained Python modules that expose MCP tools and an optional system-prompt snippet. They let you add new capabilities to the agent **without modifying any core code**.
+
+### Built-in Skills
+
+| Skill | Description |
+|-------|-------------|
+| `web_search` | Search the web via the DuckDuckGo instant-answer API using the `skill_web_search` tool |
+
+Activate the `web_search` skill via the API:
+
+```bash
+curl -X POST http://localhost:8080/api/skills/register \
+  -H 'Content-Type: application/json' \
+  -d '{"skill_name": "web_search"}'
+```
+
+### `/api/skills` Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/skills` | List all currently registered skills |
+| `POST` | `/api/skills/register` | Register a built-in skill by name or load all skills from a directory |
+| `DELETE` | `/api/skills/{skill_name}` | Unregister a skill by name |
+
+#### List registered skills
+
+```bash
+curl http://localhost:8080/api/skills
+```
+
+```json
+[
+  {
+    "name": "web_search",
+    "version": "1.0.0",
+    "description": "Enables web search capability",
+    "tool_count": 1
+  }
+]
+```
+
+#### Register a built-in skill
+
+```bash
+curl -X POST http://localhost:8080/api/skills/register \
+  -H 'Content-Type: application/json' \
+  -d '{"skill_name": "web_search"}'
+```
+
+#### Load skills from a directory
+
+```bash
+curl -X POST http://localhost:8080/api/skills/register \
+  -H 'Content-Type: application/json' \
+  -d '{"directory_path": "/app/custom-skills"}'
+```
+
+#### Unregister a skill
+
+```bash
+curl -X DELETE http://localhost:8080/api/skills/web_search
+```
+
+### Writing a Custom Skill
+
+A skill is a plain Python file with a `get_skill()` function that returns a `BaseSkill`
+instance (or a `SkillDefinition` directly).
+
+```python
+# my_skills/greet.py
+from claude_agent_sdk import tool
+from skills.base import BaseSkill, SkillDefinition
+
+
+@tool("skill_greet", "Greet a user by name", {"name": str})
+async def skill_greet(args):
+    return {
+        "content": [{"type": "text", "text": f"Hello, {args['name']}!"}]
+    }
+
+
+class GreetSkill(BaseSkill):
+    def get_definition(self) -> SkillDefinition:
+        """Return the greet skill definition."""
+        return SkillDefinition(
+            name="greet",
+            version="1.0.0",
+            description="Greets users by name",
+            tools=[skill_greet],
+            system_prompt_snippet="Use skill_greet to greet the user warmly.",
+            allowed_tool_names=["mcp__planner__skill_greet"],
+        )
+
+
+def get_skill() -> BaseSkill:
+    """Return an instance of GreetSkill."""
+    return GreetSkill()
+```
+
+Then load it:
+
+```bash
+python main.py --skills-dir ./my_skills "Greet the team"
+```
+
+Or via the API while the service is running:
+
+```bash
+curl -X POST http://localhost:8080/api/skills/register \
+  -H 'Content-Type: application/json' \
+  -d '{"directory_path": "/app/my_skills"}'
+```
+
+### `BaseSkill` Interface
+
+```python
+from skills.base import BaseSkill, SkillDefinition
+
+class BaseSkill(ABC):
+    @abstractmethod
+    def get_definition(self) -> SkillDefinition: ...
+```
+
+`SkillDefinition` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `str` | Unique skill identifier |
+| `version` | `str` | Semver string, e.g. `"1.0.0"` |
+| `description` | `str` | Human-readable description |
+| `tools` | `list[Callable]` | Tool functions decorated with `@tool` |
+| `system_prompt_snippet` | `str` | Text appended to the agent system prompt |
+| `allowed_tool_names` | `list[str]` | MCP tool name strings (e.g. `mcp__planner__skill_greet`) |
+
 ## Docker
 
 ### Build the Image
@@ -126,6 +274,22 @@ docker run -it --rm \
   planner-agent:latest \
   --cwd /app/workspace \
   "Add user authentication"
+```
+
+### Mount Custom Skills at Runtime
+
+Mount a directory of skill modules and set `PLANNER_SKILLS_DIR` to load them automatically:
+
+```bash
+docker run -it --rm \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  -e PLANNER_SKILLS_DIR=/app/custom-skills \
+  -v $(pwd)/my-skills:/app/custom-skills \
+  -v $(pwd)/workspace:/app/workspace \
+  -v $(pwd)/plans:/app/plans \
+  planner-agent:latest \
+  --cwd /app/workspace \
+  "Add search feature"
 ```
 
 ## Kubernetes Deployment
@@ -230,12 +394,21 @@ planner-agent/
 ├── planner_agent.py     # Main agent implementation
 ├── plan_manager.py      # Plan creation and persistence
 ├── task_manager.py      # Task management with dependencies
+├── workflow_service.py  # FastAPI HTTP service
+├── streaming.py         # SSE streaming helpers
 ├── requirements.txt     # Python dependencies
 ├── Dockerfile           # Container build configuration
 ├── .dockerignore        # Docker build exclusions
 ├── .env.example         # Example environment file
 ├── .gitignore           # Git ignore patterns
 ├── README.md            # This file
+├── skills/              # Skills system
+│   ├── __init__.py      # Public API (BaseSkill, SkillDefinition, SkillRegistry)
+│   ├── base.py          # BaseSkill and SkillDefinition dataclass
+│   ├── registry.py      # SkillRegistry and global skill_registry instance
+│   └── builtin/
+│       ├── __init__.py
+│       └── web_search.py  # Built-in DuckDuckGo web search skill
 └── k8s/                 # Kubernetes manifests
     ├── namespace.yaml
     ├── secret.yaml
@@ -280,6 +453,13 @@ Add more MCP tools by:
 2. Adding it to the `create_sdk_mcp_server()` call
 3. Including it in `allowed_tools`
 
+### Adding Skills
+
+The recommended extension point is the skills system. Drop a `.py` file in any
+directory, pass that directory via `--skills-dir` (CLI) or `PLANNER_SKILLS_DIR`
+(environment), and the agent picks up your tools automatically. See the
+[Skills](#skills) section for details.
+
 ### Hooks
 
 Add hooks for custom behavior at various points:
@@ -304,6 +484,7 @@ from planner_agent import PlannerAgent
 agent = PlannerAgent(
     cwd="/path/to/repo",      # Working directory
     plans_dir="./plans",      # Plans storage directory
+    skills_dir="./my-skills", # Optional directory of skill modules
 )
 
 # Run with a specific prompt

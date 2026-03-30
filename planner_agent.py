@@ -14,6 +14,7 @@ Uses the Claude Agent SDK with custom MCP tools for task/plan management.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -33,6 +34,8 @@ from claude_agent_sdk import (
 
 from task_manager import TaskManager, TaskStatus
 from plan_manager import PlanManager
+from skills.registry import skill_registry
+from skills.base import BaseSkill, SkillDefinition
 from streaming import (
     stream_execution_started,
     stream_execution_completed,
@@ -51,6 +54,7 @@ from streaming import (
 # Global instances for the tools to access
 _task_manager: TaskManager | None = None
 _plan_manager: PlanManager | None = None
+_planner_agent: "PlannerAgent | None" = None
 
 
 @tool(
@@ -257,6 +261,119 @@ async def plan_convert_to_tasks(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+# =============================================================================
+# Skill Management MCP Tools
+# =============================================================================
+
+
+@tool(
+    "skill_list",
+    "List all registered skills with their name, version, and description.",
+    {}
+)
+async def skill_list(args: dict[str, Any]) -> dict[str, Any]:
+    """Return a text table of all registered skills."""
+    skills = skill_registry.list_skills()
+    if not skills:
+        return {"content": [{"type": "text", "text": "No skills registered."}]}
+
+    header = f"{'Name':<20} {'Version':<10} {'Description'}"
+    separator = "-" * 70
+    rows = [f"{s.name:<20} {s.version:<10} {s.description}" for s in skills]
+    table = "\n".join([header, separator] + rows)
+    return {"content": [{"type": "text", "text": table}]}
+
+
+@tool(
+    "skill_register_builtin",
+    "Register a built-in skill by name, making its tools available in the current session.",
+    {"skill_name": str}
+)
+async def skill_register_builtin(args: dict[str, Any]) -> dict[str, Any]:
+    """Dynamically import and register a builtin skill, then rebuild the MCP server."""
+    skill_name = args["skill_name"]
+    module_path = f"skills.builtin.{skill_name}"
+    try:
+        module = importlib.import_module(module_path)
+    except ModuleNotFoundError as exc:
+        missing = exc.name or ""
+        if missing == module_path or missing.startswith("skills."):
+            return {
+                "content": [{"type": "text", "text": f"Error: No built-in skill module found for '{skill_name}'"}],
+                "is_error": True,
+            }
+        return {
+            "content": [{"type": "text", "text": f"Error: Skill '{skill_name}' requires missing package '{missing}'"}],
+            "is_error": True,
+        }
+
+    get_skill_fn = getattr(module, "get_skill", None)
+    if not callable(get_skill_fn):
+        return {
+            "content": [{"type": "text", "text": f"Error: Module \'{module_path}\' has no get_skill() function"}],
+            "is_error": True,
+        }
+
+    try:
+        skill = get_skill_fn()
+        skill_registry.register(skill)
+    except ValueError as e:
+        return {"content": [{"type": "text", "text": f"Error: {e}"}], "is_error": True}
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"Error registering skill: {e}"}], "is_error": True}
+
+    if _planner_agent is not None:
+        _planner_agent._rebuild_mcp_server()
+
+    definition = skill.get_definition() if isinstance(skill, BaseSkill) else skill
+    return {
+        "content": [{"type": "text", "text": f"Registered skill \'{definition.name}\' v{definition.version}"}]
+    }
+
+
+@tool(
+    "skill_load_directory",
+    "Load and register all skills found in a directory.",
+    {"directory_path": str}
+)
+async def skill_load_directory(args: dict[str, Any]) -> dict[str, Any]:
+    """Load skills from a directory and return how many were loaded."""
+    directory_path = args["directory_path"]
+    try:
+        loaded = skill_registry.load_from_directory(directory_path)
+    except NotADirectoryError as e:
+        return {"content": [{"type": "text", "text": f"Error: {e}"}], "is_error": True}
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"Error loading skills: {e}"}], "is_error": True}
+
+    count = len(loaded)
+    if count == 0:
+        return {"content": [{"type": "text", "text": f"No skills loaded from \'{directory_path}\'"}]}
+
+    names = ", ".join(loaded)
+    return {
+        "content": [{"type": "text", "text": f"Loaded {count} skill(s) from \'{directory_path}\': {names}"}]
+    }
+
+
+@tool(
+    "skill_unregister",
+    "Unregister a skill by name, removing its tools from future sessions.",
+    {"skill_name": str}
+)
+async def skill_unregister(args: dict[str, Any]) -> dict[str, Any]:
+    """Unregister a skill by name."""
+    skill_name = args["skill_name"]
+    removed = skill_registry.unregister(skill_name)
+    if removed:
+        return {"content": [{"type": "text", "text": f"Unregistered skill \'{skill_name}\'"}]}
+    return {
+        "content": [{"type": "text", "text": f"Skill \'{skill_name}\' was not registered"}],
+        "is_error": True,
+    }
+
+
 # =============================================================================
 # Planner Agent Class
 # =============================================================================
@@ -278,26 +395,34 @@ class PlannerAgent:
         self,
         cwd: str | Path | None = None,
         plans_dir: str | Path | None = None,
+        skills_dir: str | Path | None = None,
     ):
-        """
-        Initialize the planner agent.
-
-        Args:
-            cwd: Working directory for the agent (the git repo to work in)
-            plans_dir: Directory to store plans and tasks
-        """
+        """Initialize the planner agent."""
         self.cwd = Path(cwd) if cwd else Path.cwd()
         self.plans_dir = Path(plans_dir) if plans_dir else self.cwd / "plans"
+        self.skills_dir = Path(skills_dir) if skills_dir else None
 
         # Initialize managers
-        global _task_manager, _plan_manager
+        global _task_manager, _plan_manager, _planner_agent
         _task_manager = TaskManager(self.plans_dir / "tasks.json")
         _plan_manager = PlanManager(self.plans_dir)
+        _planner_agent = self
 
         self.task_manager = _task_manager
         self.plan_manager = _plan_manager
 
-        # Create MCP server with our tools
+        # Auto-load external skills from the provided directory
+        if self.skills_dir and self.skills_dir.is_dir():
+            skill_registry.load_from_directory(self.skills_dir)
+
+        # Build the initial MCP server
+        self._rebuild_mcp_server()
+
+        self.client: ClaudeSDKClient | None = None
+        self.session_id: str | None = None
+
+    def _rebuild_mcp_server(self) -> None:
+        """Rebuild and store the MCP server including all currently registered skill tools."""
         self.mcp_server = create_sdk_mcp_server(
             name="planner",
             version="1.0.0",
@@ -309,15 +434,17 @@ class PlannerAgent:
                 plan_create,
                 plan_get,
                 plan_convert_to_tasks,
+                skill_list,
+                skill_register_builtin,
+                skill_load_directory,
+                skill_unregister,
+                *skill_registry.get_all_tools(),
             ]
         )
 
-        self.client: ClaudeSDKClient | None = None
-        self.session_id: str | None = None
-
     def _get_planning_system_prompt(self) -> str:
         """Get the system prompt for planning mode."""
-        return """You are a software planning agent that helps users implement new features in their codebase.
+        base_prompt = """You are a software planning agent that helps users implement new features in their codebase.
 
 ## Your Workflow
 
@@ -391,7 +518,17 @@ For implementation:
 
 For user interaction:
 - AskUserQuestion: Ask the user clarifying questions with options
+
+For skill management:
+- mcp__planner__skill_list: List all registered skills
+- mcp__planner__skill_register_builtin: Register a built-in skill by name
+- mcp__planner__skill_load_directory: Load skills from a directory
+- mcp__planner__skill_unregister: Unregister a skill by name
 """
+        snippet = skill_registry.get_combined_system_prompt_snippet()
+        if snippet:
+            base_prompt += f"\n## Active Skill Capabilities\n\n{snippet}\n"
+        return base_prompt
 
     async def run_planning_only(self, feature_request: str) -> None:
         """
@@ -415,6 +552,8 @@ For user interaction:
                 "Glob",
                 "Grep",
                 "Bash",
+                # Registered skill tools
+                *skill_registry.get_all_allowed_tool_names(),
             ],
             permission_mode="acceptEdits",
             cwd=str(self.cwd),
@@ -549,6 +688,8 @@ Example steps_json format: [{{"title": "Step 1", "description": "...", "files_af
                 # Code modification tools
                 "Write",
                 "Edit",
+                # Registered skill tools
+                *skill_registry.get_all_allowed_tool_names(),
             ],
             permission_mode="acceptEdits",
             cwd=str(self.cwd),
@@ -681,7 +822,7 @@ Focus only on this task. Do not modify any other parts of the codebase."""
 
     def _get_execution_system_prompt(self) -> str:
         """Get the system prompt for execution mode."""
-        return """You are a software implementation agent that executes pre-planned tasks.
+        base_prompt = """You are a software implementation agent that executes pre-planned tasks.
 
 ## Your Role
 
@@ -725,6 +866,10 @@ For implementation:
 - Edit: Modify existing files
 - Bash: Run commands (tests, builds, etc.)
 """
+        snippet = skill_registry.get_combined_system_prompt_snippet()
+        if snippet:
+            base_prompt += f"\n\n## Active Skills\n\n{snippet}"
+        return base_prompt
 
     async def run_planning_session(self, feature_request: str) -> None:
         """
@@ -746,6 +891,11 @@ For implementation:
                 "mcp__planner__task_update",
                 "mcp__planner__task_list",
                 "mcp__planner__task_get",
+                # Skill management tools
+                "mcp__planner__skill_list",
+                "mcp__planner__skill_register_builtin",
+                "mcp__planner__skill_load_directory",
+                "mcp__planner__skill_unregister",
                 # Code exploration tools
                 "Read",
                 "Glob",
@@ -756,6 +906,8 @@ For implementation:
                 "Edit",
                 # User interaction
                 "AskUserQuestion",
+                # Registered skill tools
+                *skill_registry.get_all_allowed_tool_names(),
             ],
             permission_mode="acceptEdits",
             cwd=str(self.cwd),
@@ -883,6 +1035,12 @@ async def main():
         help="Directory to store plans and tasks",
     )
     parser.add_argument(
+        "--skills-dir",
+        type=str,
+        default=None,
+        help="Directory containing external skill modules to auto-load",
+    )
+    parser.add_argument(
         "prompt",
         nargs="?",
         type=str,
@@ -895,6 +1053,7 @@ async def main():
     agent = PlannerAgent(
         cwd=args.cwd,
         plans_dir=args.plans_dir,
+        skills_dir=args.skills_dir,
     )
 
     if args.prompt:
