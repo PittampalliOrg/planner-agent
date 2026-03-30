@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from task_manager import TaskManager, Task, TaskStatus
+from task_manager import TaskManager, Task, TaskStatus, TaskMetrics
 
 
 @dataclass
@@ -364,3 +364,82 @@ class PlanManager:
         if not self.storage_dir.exists():
             return []
         return [f.stem for f in self.storage_dir.glob("*.json")]
+
+    def get_execution_summary(
+        self,
+        task_manager: TaskManager,
+        plan: Plan | None = None,
+    ) -> str:
+        """Generate a human-readable execution report from task metrics."""
+        target = plan or self.current_plan
+        if not target:
+            return "No plan available."
+
+        plan_metrics = task_manager.get_plan_metrics()
+
+        def _fmt_ms(ms: float) -> str:
+            if ms < 1000:
+                return f"{ms:.0f}ms"
+            secs = ms / 1000
+            if secs < 60:
+                return f"{secs:.1f}s"
+            mins = secs / 60
+            return f"{mins:.1f}m"
+
+        lines = [
+            f"# Execution Summary: {target.title}",
+            "",
+            f"**Plan ID:** {target.id}",
+            f"**Status:** {target.status}",
+            f"**Total tasks:** {plan_metrics['total_tasks']}",
+            f"**Completed:** {plan_metrics['completed']}",
+            f"**Failed:** {plan_metrics['failed']}",
+        ]
+
+        if plan_metrics["total_wall_clock_ms"] > 0:
+            lines.append(
+                f"**Total wall-clock time:** "
+                f"{_fmt_ms(plan_metrics['total_wall_clock_ms'])}"
+            )
+        if plan_metrics["avg_duration_ms"] > 0:
+            lines.append(
+                f"**Avg task duration:** "
+                f"{_fmt_ms(plan_metrics['avg_duration_ms'])}"
+            )
+
+        lines.extend(["", "## Task Breakdown", ""])
+
+        for task in task_manager.list_tasks():
+            if task.metadata.get("plan_id") != target.id:
+                continue
+            metrics = task_manager.get_task_metrics(task.id)
+            status_icon = {
+                TaskStatus.PENDING: "⏳",
+                TaskStatus.IN_PROGRESS: "🔄",
+                TaskStatus.COMPLETED: "✅",
+            }.get(task.status, "❓")
+
+            line = f"- {status_icon} **{task.subject}**"
+            if metrics and metrics.total_duration_ms > 0:
+                line += f" — {_fmt_ms(metrics.total_duration_ms)}"
+            if metrics and metrics.attempt_count > 1:
+                line += f" ({metrics.attempt_count} attempts)"
+            if metrics and metrics.error_count > 0:
+                line += f" ⚠️ {metrics.error_count} error(s)"
+            lines.append(line)
+
+        errors: list[str] = []
+        for task in task_manager.list_tasks():
+            if task.metadata.get("plan_id") != target.id:
+                continue
+            for ev in task.events:
+                if ev.error:
+                    errors.append(
+                        f"- Task {task.id} ({task.subject}): {ev.error}"
+                    )
+
+        if errors:
+            lines.extend(["", "## Errors", ""])
+            lines.extend(errors)
+
+        return "\n".join(lines)

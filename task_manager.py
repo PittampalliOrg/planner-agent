@@ -23,6 +23,58 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
 
 
+class EventType(str, Enum):
+    """Types of task execution events."""
+    STARTED = "started"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    RETRIED = "retried"
+    BLOCKED = "blocked"
+    UNBLOCKED = "unblocked"
+
+
+@dataclass
+class TaskEvent:
+    """A single execution event for a task."""
+    event_type: EventType
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    duration_ms: float | None = None
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert event to dictionary for serialization."""
+        return {
+            "event_type": self.event_type.value,
+            "timestamp": self.timestamp,
+            "duration_ms": self.duration_ms,
+            "error": self.error,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TaskEvent:
+        """Create a TaskEvent from a dictionary."""
+        return cls(
+            event_type=EventType(data["event_type"]),
+            timestamp=data.get("timestamp", datetime.now().isoformat()),
+            duration_ms=data.get("duration_ms"),
+            error=data.get("error"),
+            metadata=data.get("metadata", {}),
+        )
+
+
+@dataclass
+class TaskMetrics:
+    """Computed metrics for a single task."""
+    total_duration_ms: float
+    attempt_count: int
+    first_started_at: str | None
+    last_completed_at: str | None
+    error_count: int
+    blocked_duration_ms: float
+
+
 @dataclass
 class Task:
     """
@@ -50,6 +102,7 @@ class Task:
     blocks: list[str] = field(default_factory=list)
     blocked_by: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    events: list[TaskEvent] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -69,6 +122,7 @@ class Task:
             "blocks": self.blocks,
             "blocked_by": self.blocked_by,
             "metadata": self.metadata,
+            "events": [e.to_dict() for e in self.events],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -86,6 +140,7 @@ class Task:
             blocks=data.get("blocks", []),
             blocked_by=data.get("blocked_by", []),
             metadata=data.get("metadata", {}),
+            events=[TaskEvent.from_dict(e) for e in data.get("events", [])],
             created_at=data.get("created_at", datetime.now().isoformat()),
             updated_at=data.get("updated_at", datetime.now().isoformat()),
         )
@@ -223,8 +278,9 @@ class TaskManager:
         if status is not None:
             if isinstance(status, str):
                 status = TaskStatus(status)
+            old_status = task.status
             task.status = status
-            # When a task completes, remove it from other tasks' blocked_by lists
+            self._record_status_event(task, old_status, status)
             if status == TaskStatus.COMPLETED:
                 self._resolve_dependencies(task_id)
         if active_form is not None:
@@ -283,7 +339,9 @@ class TaskManager:
             return None
 
         task.owner = owner
+        old_status = task.status
         task.status = TaskStatus.IN_PROGRESS
+        self._record_status_event(task, old_status, TaskStatus.IN_PROGRESS)
         task.updated_at = datetime.now().isoformat()
         return task
 
@@ -298,6 +356,186 @@ class TaskManager:
             The completed Task or None if not found
         """
         return self.update_task(task_id, status=TaskStatus.COMPLETED)
+
+    def _record_status_event(
+        self,
+        task: Task,
+        old_status: TaskStatus,
+        new_status: TaskStatus,
+    ) -> None:
+        """Append a TaskEvent based on a status transition."""
+        now = datetime.now().isoformat()
+
+        if new_status == TaskStatus.IN_PROGRESS and old_status == TaskStatus.PENDING:
+            task.events.append(TaskEvent(event_type=EventType.STARTED, timestamp=now))
+        elif new_status == TaskStatus.IN_PROGRESS and old_status == TaskStatus.COMPLETED:
+            task.events.append(TaskEvent(event_type=EventType.RETRIED, timestamp=now))
+        elif new_status == TaskStatus.COMPLETED:
+            duration_ms = self._compute_duration_ms(task)
+            task.events.append(TaskEvent(
+                event_type=EventType.COMPLETED,
+                timestamp=now,
+                duration_ms=duration_ms,
+            ))
+        elif new_status == TaskStatus.PENDING and old_status == TaskStatus.IN_PROGRESS:
+            task.events.append(TaskEvent(event_type=EventType.FAILED, timestamp=now))
+
+    @staticmethod
+    def _compute_duration_ms(task: Task) -> float | None:
+        """Compute ms elapsed since the last started/retried event."""
+        for event in reversed(task.events):
+            if event.event_type in (EventType.STARTED, EventType.RETRIED):
+                try:
+                    start = datetime.fromisoformat(event.timestamp)
+                    end = datetime.now()
+                    return (end - start).total_seconds() * 1000
+                except (ValueError, TypeError):
+                    return None
+        return None
+
+    def record_task_event(
+        self,
+        task_id: str,
+        event_type: EventType | str,
+        *,
+        duration_ms: float | None = None,
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> TaskEvent | None:
+        """Manually record an event on a task."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return None
+        if isinstance(event_type, str):
+            event_type = EventType(event_type)
+        event = TaskEvent(
+            event_type=event_type,
+            duration_ms=duration_ms,
+            error=error,
+            metadata=metadata or {},
+        )
+        task.events.append(event)
+        return event
+
+    def get_task_metrics(self, task_id: str) -> TaskMetrics | None:
+        """Compute metrics for a single task from its event history."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return None
+
+        events = task.events
+        total_duration_ms: float = 0.0
+        attempt_count = 0
+        first_started_at: str | None = None
+        last_completed_at: str | None = None
+        error_count = 0
+        blocked_duration_ms: float = 0.0
+
+        last_blocked_at: str | None = None
+
+        for ev in events:
+            if ev.event_type in (EventType.STARTED, EventType.RETRIED):
+                attempt_count += 1
+                if first_started_at is None:
+                    first_started_at = ev.timestamp
+            elif ev.event_type == EventType.COMPLETED:
+                last_completed_at = ev.timestamp
+                if ev.duration_ms is not None:
+                    total_duration_ms += ev.duration_ms
+            elif ev.event_type == EventType.FAILED:
+                error_count += 1
+            elif ev.event_type == EventType.BLOCKED:
+                last_blocked_at = ev.timestamp
+            elif ev.event_type == EventType.UNBLOCKED:
+                if last_blocked_at:
+                    try:
+                        b_start = datetime.fromisoformat(last_blocked_at)
+                        b_end = datetime.fromisoformat(ev.timestamp)
+                        blocked_duration_ms += (b_end - b_start).total_seconds() * 1000
+                    except (ValueError, TypeError):
+                        pass
+                    last_blocked_at = None
+
+        return TaskMetrics(
+            total_duration_ms=total_duration_ms,
+            attempt_count=attempt_count,
+            first_started_at=first_started_at,
+            last_completed_at=last_completed_at,
+            error_count=error_count,
+            blocked_duration_ms=blocked_duration_ms,
+        )
+
+    def get_plan_metrics(self) -> dict[str, Any]:
+        """Return aggregate metrics across all tasks."""
+        total = len(self.tasks)
+        completed = 0
+        failed = 0
+        durations: list[float] = []
+        longest_task: str | None = None
+        longest_duration: float = 0.0
+        earliest_start: str | None = None
+        latest_end: str | None = None
+
+        for task in self.tasks.values():
+            metrics = self.get_task_metrics(task.id)
+            if metrics is None:
+                continue
+            if task.status == TaskStatus.COMPLETED:
+                completed += 1
+            if metrics.error_count > 0:
+                failed += 1
+            if metrics.total_duration_ms > 0:
+                durations.append(metrics.total_duration_ms)
+                if metrics.total_duration_ms > longest_duration:
+                    longest_duration = metrics.total_duration_ms
+                    longest_task = task.id
+            if metrics.first_started_at:
+                if earliest_start is None or metrics.first_started_at < earliest_start:
+                    earliest_start = metrics.first_started_at
+            if metrics.last_completed_at:
+                if latest_end is None or metrics.last_completed_at > latest_end:
+                    latest_end = metrics.last_completed_at
+
+        avg_duration = sum(durations) / len(durations) if durations else 0.0
+
+        total_wall_clock_ms: float = 0.0
+        if earliest_start and latest_end:
+            try:
+                wall_start = datetime.fromisoformat(earliest_start)
+                wall_end = datetime.fromisoformat(latest_end)
+                total_wall_clock_ms = (wall_end - wall_start).total_seconds() * 1000
+            except (ValueError, TypeError):
+                pass
+
+        return {
+            "total_tasks": total,
+            "completed": completed,
+            "failed": failed,
+            "avg_duration_ms": avg_duration,
+            "longest_task_id": longest_task,
+            "longest_duration_ms": longest_duration,
+            "total_wall_clock_ms": total_wall_clock_ms,
+        }
+
+    def get_task_timeline(self, task_id: str) -> str:
+        """Return a formatted string showing the event timeline for a task."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return f"Task {task_id} not found."
+        if not task.events:
+            return f"Task {task_id} ({task.subject}): no events recorded."
+
+        lines = [f"Timeline for task {task_id}: {task.subject}"]
+        for ev in task.events:
+            parts = [f"  [{ev.timestamp}] {ev.event_type.value}"]
+            if ev.duration_ms is not None:
+                parts.append(f"duration={ev.duration_ms:.1f}ms")
+            if ev.error:
+                parts.append(f"error={ev.error!r}")
+            if ev.metadata:
+                parts.append(f"metadata={ev.metadata}")
+            lines.append("  ".join(parts))
+        return "\n".join(lines)
 
     def get_task_stats(self) -> dict[str, int]:
         """Get statistics about task statuses."""
