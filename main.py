@@ -11,12 +11,14 @@ Usage:
     python main.py --cwd /path/to/repo "Add feature"  # Specify working directory
 """
 
+import argparse
 import asyncio
 import sys
 
 from claude_agent_sdk import CLINotFoundError, ProcessError, CLIJSONDecodeError
 
 from planner_agent import main
+from version import __version__
 
 
 async def run_with_error_handling() -> None:
@@ -46,4 +48,7 @@ async def run_with_error_handling() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    parser.parse_args()
     asyncio.run(run_with_error_handling())
