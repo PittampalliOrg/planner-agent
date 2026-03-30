@@ -1,0 +1,38 @@
+[project]
+name = "planner-agent"
+version = "0.1.0"
+description = "A Claude Agent SDK application that replicates Claude Code's plan mode"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.22",
+    "pydantic>=2.0.0",
+    "rich>=13.0.0",
+    "dapr-ext-workflow>=1.16.0",
+    "dapr>=1.16.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "httpx>=0.25.0",
+    "gitpython>=3.1.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "ANN"]
+ignore = ["ANN101", "ANN102", "ANN401", "B008", "E501"]
+unfixable = ["B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["planner_agent", "plan_manager", "task_manager", "streaming", "workflow_service"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["ANN"]
