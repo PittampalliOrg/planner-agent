@@ -403,14 +403,9 @@ async def execute_plan(request: ExecuteRequest) -> ExecuteResponse:
 
 
 @app.get("/health")
-async def health():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "dapr_available": DAPR_AVAILABLE,
-        "workspace": str(WORKSPACE_DIR),
-        "plans_dir": str(PLANS_DIR),
-    }
+async def health() -> dict[str, str]:
+    """Return service health status."""
+    return {"status": "ok"}
 
 
 @app.get("/")
