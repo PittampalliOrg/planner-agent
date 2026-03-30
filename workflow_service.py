@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -407,9 +408,22 @@ async def health():
     """Health check endpoint."""
     return {
         "status": "healthy",
+        "service": "planner-agent-workflow-service",
+        "version": "1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "dapr_available": DAPR_AVAILABLE,
         "workspace": str(WORKSPACE_DIR),
         "plans_dir": str(PLANS_DIR),
+    }
+
+
+@app.get("/hello")
+async def hello():
+    """Hello World endpoint."""
+    return {
+        "message": "Hello, World!",
+        "service": "planner-agent-workflow-service",
+        "version": "1.0.0",
     }
 
 
@@ -424,6 +438,7 @@ async def root():
             "/api/plan",
             "/api/execute",
             "/health",
+            "/hello",
         ],
     }
 
