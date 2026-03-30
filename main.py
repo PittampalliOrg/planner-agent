@@ -14,6 +14,8 @@ Usage:
 import asyncio
 import sys
 
+from version import __version__
+
 from claude_agent_sdk import CLINotFoundError, ProcessError, CLIJSONDecodeError
 
 from planner_agent import main
