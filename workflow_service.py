@@ -13,6 +13,7 @@ This service is designed to integrate with the TypeScript workflow-patterns
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import shutil
 import subprocess
@@ -36,6 +37,8 @@ except ImportError:
     WorkflowRuntime = None
 
 from planner_agent import PlannerAgent
+from skills.base import SkillDefinition
+from skills.registry import skill_registry
 
 
 # =============================================================================
@@ -70,6 +73,7 @@ class PlanRequest(BaseModel):
     """Request model for plan creation."""
     cwd: str
     prompt: str
+    skills_dir: str | None = None
 
 
 class PlanStepResponse(BaseModel):
@@ -102,6 +106,7 @@ class ExecuteRequest(BaseModel):
     repo_path: str
     plan_id: str
     workflow_id: str
+    skills_dir: str | None = None
 
 
 class ExecuteResponse(BaseModel):
@@ -111,6 +116,21 @@ class ExecuteResponse(BaseModel):
     tasks_total: int = 0
     files_changed: list[str] = []
     error: str | None = None
+
+
+
+class SkillInfo(BaseModel):
+    """Summary info for a registered skill."""
+    name: str
+    version: str
+    description: str
+    tool_count: int
+
+
+class RegisterSkillRequest(BaseModel):
+    """Request model for registering a skill."""
+    skill_name: str
+    directory_path: str | None = None
 
 
 # =============================================================================
@@ -274,6 +294,7 @@ async def create_plan(request: PlanRequest) -> PlanCreateResponse:
         agent = PlannerAgent(
             cwd=request.cwd,
             plans_dir=str(PLANS_DIR),
+            skills_dir=request.skills_dir,
         )
 
         # Run planning (exploration + plan creation, not implementation)
@@ -374,6 +395,7 @@ async def execute_plan(request: ExecuteRequest) -> ExecuteResponse:
         agent = PlannerAgent(
             cwd=request.repo_path,
             plans_dir=str(PLANS_DIR),
+            skills_dir=request.skills_dir,
         )
 
         # Run execution
@@ -402,6 +424,56 @@ async def execute_plan(request: ExecuteRequest) -> ExecuteResponse:
         )
 
 
+
+@app.get("/api/skills", response_model=list[SkillInfo])
+async def list_skills() -> list[SkillInfo]:
+    """Return all currently registered skills."""
+    return [
+        SkillInfo(
+            name=skill.name,
+            version=skill.version,
+            description=skill.description,
+            tool_count=len(skill.tools),
+        )
+        for skill in skill_registry.list_skills()
+    ]
+
+
+@app.post("/api/skills/register")
+async def register_skill(request: RegisterSkillRequest) -> dict:
+    """Register a builtin skill by name or load skills from a directory path."""
+    registered: list[str] = []
+    error: str | None = None
+
+    try:
+        if request.directory_path is not None:
+            registered = skill_registry.load_from_directory(request.directory_path)
+        else:
+            module = importlib.import_module(f"skills.builtin.{request.skill_name}")
+            get_skill_fn = getattr(module, "get_skill", None)
+            if not callable(get_skill_fn):
+                raise ValueError(
+                    f"Module 'skills.builtin.{request.skill_name}' has no get_skill() function"
+                )
+            skill = get_skill_fn()
+            skill_registry.register(skill)
+            definition = (
+                skill.get_definition() if hasattr(skill, "get_definition") else skill
+            )
+            registered.append(definition.name)
+    except Exception as e:
+        error = str(e)
+
+    return {"registered": registered, "error": error}
+
+
+@app.delete("/api/skills/{skill_name}")
+async def unregister_skill(skill_name: str) -> dict:
+    """Unregister a skill by name."""
+    success = skill_registry.unregister(skill_name)
+    return {"success": success}
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -423,6 +495,9 @@ async def root():
             "/api/clone",
             "/api/plan",
             "/api/execute",
+            "/api/skills",
+            "/api/skills/register",
+            "/api/skills/{skill_name}",
             "/health",
         ],
     }
@@ -485,8 +560,9 @@ def create_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dict
     """
     cwd = input_data["cwd"]
     prompt = input_data["prompt"]
+    skills_dir = input_data.get("skills_dir")
 
-    agent = PlannerAgent(cwd=cwd, plans_dir=str(PLANS_DIR))
+    agent = PlannerAgent(cwd=cwd, plans_dir=str(PLANS_DIR), skills_dir=skills_dir)
 
     # Run async planning in sync context
     asyncio.run(agent.run_planning_only(prompt))
@@ -525,8 +601,9 @@ def execute_plan_activity(ctx: WorkflowActivityContext, input_data: dict) -> dic
     repo_path = input_data["repo_path"]
     plan_id = input_data["plan_id"]
     workflow_id = input_data["workflow_id"]
+    skills_dir = input_data.get("skills_dir")
 
-    agent = PlannerAgent(cwd=repo_path, plans_dir=str(PLANS_DIR))
+    agent = PlannerAgent(cwd=repo_path, plans_dir=str(PLANS_DIR), skills_dir=skills_dir)
 
     # Run async execution in sync context
     result = asyncio.run(agent.run_execution_only(plan_id, workflow_id))

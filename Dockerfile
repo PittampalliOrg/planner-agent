@@ -55,6 +55,7 @@ COPY --chown=planner:planner planner_agent.py .
 COPY --chown=planner:planner workflow_service.py .
 COPY --chown=planner:planner streaming.py .
 COPY --chown=planner:planner main.py .
+COPY --chown=planner:planner skills/ ./skills/
 
 # Create directories for plans and workspace
 RUN mkdir -p /app/plans /app/workspace && \
@@ -72,6 +73,11 @@ ENV PYTHONUNBUFFERED=1 \
 # Default working directory for the agent (can be overridden)
 ENV PLANNER_CWD=/app/workspace \
     PLANNER_PLANS_DIR=/app/plans
+
+# Path to an optional directory of external skill modules to auto-load at startup.
+# Leave empty (default) to use only built-in skills.
+# Mount a volume and set this to the mount path to add custom skills at runtime.
+ENV PLANNER_SKILLS_DIR=
 
 # Health check - verify FastAPI health endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

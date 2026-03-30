@@ -11,3 +11,5 @@ uvicorn>=0.23.0
 httpx>=0.25.0
 # Git operations
 gitpython>=3.1.0
+# Skills system (built-in skills)
+# httpx (above) is reused by the web_search built-in skill
