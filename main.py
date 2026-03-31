@@ -45,5 +45,10 @@ async def run_with_error_handling() -> None:
         sys.exit(0)
 
 
+def run() -> None:
+    """Synchronous entry point for the planner-agent console script."""
+    asyncio.run(run_with_error_handling())
+
+
 if __name__ == "__main__":
     asyncio.run(run_with_error_handling())
