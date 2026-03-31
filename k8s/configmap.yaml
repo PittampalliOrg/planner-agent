@@ -10,6 +10,9 @@ data:
   PLANNER_CWD: "/app/workspace"
   # Directory to store plans and tasks
   PLANNER_PLANS_DIR: "/app/plans"
+  # Agent workspace and plans directories
+  WORKSPACE_DIR: "/workspace"
+  PLANS_DIR: "/plans"
   # Python settings
   PYTHONUNBUFFERED: "1"
   PYTHONDONTWRITEBYTECODE: "1"
