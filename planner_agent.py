@@ -498,8 +498,9 @@ Example steps_json format: [{{"title": "Step 1", "description": "...", "files_af
 
         # Load the plan if not already loaded
         if not self.plan_manager.current_plan or self.plan_manager.current_plan.id != plan_id:
-            loaded = self.plan_manager.load_plan(plan_id)
-            if not loaded:
+            try:
+                self.plan_manager.load_plan(plan_id)
+            except FileNotFoundError:
                 error = f"Plan {plan_id} not found"
                 await stream_execution_failed(workflow_id, error, 0)
                 return {
