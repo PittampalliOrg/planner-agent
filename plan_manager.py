@@ -221,7 +221,7 @@ class PlanManager:
                     title=step_data.get("title", f"Step {i}"),
                     description=step_data.get("description", ""),
                     files_affected=step_data.get("files_affected", []),
-                    estimated_complexity=step_data.get("estimated_complexity", "medium"),
+                    estimated_complexity=step_data.get("estimated_complexity") or step_data.get("complexity", "medium"),
                 ))
 
         plan = Plan(
@@ -337,23 +337,26 @@ class PlanManager:
 
         return json_path
 
-    def load_plan(self, filename: str) -> Plan:
+    def load_plan(self, filename: str) -> Plan | None:
         """
-        Load a plan from disk.
+        Load a plan from disk, returning None if the file does not exist.
 
         Args:
             filename: Filename (with or without .json extension)
 
         Returns:
-            The loaded Plan
+            The loaded Plan, or None if not found
         """
         if not filename.endswith(".json"):
             filename = f"{filename}.json"
 
         path = self.storage_dir / filename
 
-        with open(path, "r") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
 
         plan = Plan.from_dict(data)
         self.current_plan = plan

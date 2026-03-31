@@ -13,6 +13,7 @@ This service is designed to integrate with the TypeScript workflow-patterns
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -35,6 +36,7 @@ except ImportError:
     WorkflowActivityContext = None
     WorkflowRuntime = None
 
+from plan_manager import PlanManager
 from planner_agent import PlannerAgent
 
 
@@ -95,6 +97,19 @@ class PlanCreateResponse(BaseModel):
     """Wrapper response for plan creation."""
     plan: PlanResponse | None = None
     error: str | None = None
+
+
+class PlanSummary(BaseModel):
+    """Summary of a saved plan."""
+    id: str
+    title: str
+    status: str
+    created_at: str
+
+
+class PlanListResponse(BaseModel):
+    """Response model for listing saved plans."""
+    plans: list[PlanSummary]
 
 
 class ExecuteRequest(BaseModel):
@@ -349,6 +364,30 @@ async def create_plan(request: PlanRequest) -> PlanCreateResponse:
         )
 
 
+@app.get("/api/plans", response_model=PlanListResponse)
+async def list_plans() -> PlanListResponse:
+    """Return a summary list of all saved plans from PLANS_DIR."""
+    pm = PlanManager(PLANS_DIR)
+    plan_ids = pm.list_plans()
+
+    summaries: list[PlanSummary] = []
+    for plan_id in plan_ids:
+        json_path = PLANS_DIR / f"{plan_id}.json"
+        try:
+            with open(json_path) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        summaries.append(PlanSummary(
+            id=data.get("id", plan_id),
+            title=data.get("title", ""),
+            status=data.get("status", "draft"),
+            created_at=data.get("created_at", ""),
+        ))
+
+    return PlanListResponse(plans=summaries)
+
+
 @app.post("/api/execute", response_model=ExecuteResponse)
 async def execute_plan(request: ExecuteRequest) -> ExecuteResponse:
     """
@@ -422,6 +461,7 @@ async def root():
         "endpoints": [
             "/api/clone",
             "/api/plan",
+            "/api/plans",
             "/api/execute",
             "/health",
         ],
